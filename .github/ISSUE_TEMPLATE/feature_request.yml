@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose a scoped RTL8822C capability or compatibility improvement
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or missing capability
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Hardware, Linux reference, or runtime evidence
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Proposed scope and validation plan
+    validations:
+      required: true

@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  release-gate:
+    # The driver target is x86_64. The generic macos-15 label now selects an
+    # arm64 image, so pin the official Intel runner explicitly.
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch pinned MacKernelSDK
+        run: |
+          git clone https://github.com/acidanthera/MacKernelSDK.git ../MacKernelSDK
+          git -C ../MacKernelSDK checkout 05094e5e88cec7caedbfb35e8449ed0db94bf95b
+      - name: Fetch pinned Linux rtw88 reference
+        run: |
+          git clone https://github.com/lwfinger/rtw88.git ../rtw88
+          git -C ../rtw88 checkout a56bcd26e770257612a0803249cbd4095fc6feca
+      - name: Build, test, reproduce and package
+        run: make release-check
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RealtekRTL8822C-${{ github.sha }}
+          path: build/package/
+          if-no-files-found: error

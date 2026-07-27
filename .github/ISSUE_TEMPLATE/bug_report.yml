@@ -1,0 +1,48 @@
+name: Bug report
+description: Report a reproducible RTL8822C driver problem
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include passwords, key material, private SSIDs/BSSIDs, or unredacted logs.
+  - type: input
+    id: version
+    attributes:
+      label: Driver version and configuration
+      placeholder: 0.0.1 Debug or Release
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware and PCI ID
+      placeholder: RTL8822CE, 10ec:c822, chip cut if known
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and observed behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Redacted rtl8822cctl report
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I removed credentials, keys and private network identifiers.
+          required: true
+        - label: I tested without VPN or packet-filter software where applicable.
+          required: true

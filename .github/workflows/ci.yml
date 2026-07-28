@@ -14,7 +14,7 @@ jobs:
     runs-on: macos-15-intel
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Fetch pinned MacKernelSDK
         run: |
           git clone https://github.com/acidanthera/MacKernelSDK.git ../MacKernelSDK
@@ -25,7 +25,7 @@ jobs:
           git -C ../rtw88 checkout a56bcd26e770257612a0803249cbd4095fc6feca
       - name: Build, test, reproduce and package
         run: make release-check
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: RealtekRTL8822C-${{ github.sha }}
           path: build/package/

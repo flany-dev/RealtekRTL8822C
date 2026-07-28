@@ -91,8 +91,16 @@ verifies firmware and Linux table provenance, checks the public documentation
 surface, confirms reproducible Release builds, and creates a checksummed archive
 under `build/package/`.
 
-`make package` creates the public Release archive. `make package-local` creates
-an equivalent locally named test archive. Neither command installs anything.
+`make package` creates the complete maintainer archive plus two kext-only
+GitHub Release assets:
+
+- `build/package/RealtekRTL8822C-0.0.1-Release.zip`;
+- `build/package/RealtekRTL8822C-0.0.1-Debug.zip`.
+
+Each of those two archives contains only `RealtekRTL8822C.kext`. The Release
+asset is intended for ordinary use; Debug is intended for diagnostic reports.
+`make package-local` creates the complete locally named test archive. None of
+these commands installs anything.
 
 ## Runtime control
 

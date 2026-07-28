@@ -3,7 +3,7 @@
 *.d
 *.log
 *.kext
-rtl8822cctl
+/rtl8822cctl
 build/
 DerivedData/
 MacKernelSDK/

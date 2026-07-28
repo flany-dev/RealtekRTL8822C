@@ -64,7 +64,7 @@ DEPENDENCIES := $(DRIVER_OBJECTS:.o=.d)
 
 .PHONY: all debug release tools symbols check privacy-check format-check dma-cache-policy-check release-surface-check profile-check tables-check \
 	test host-sanitizers reproducibility-check release-check package package-local \
-	package-internal verify-publication clean distclean verify-env
+	package-internal package-kexts verify-publication clean distclean verify-env
 
 all: verify-env $(KEXT_BINARY)
 
@@ -224,6 +224,15 @@ package-local:
 
 package: verify-publication
 	$(MAKE) CONFIG=Release PACKAGE_SUFFIX= package-internal
+	$(MAKE) package-kexts
+
+package-kexts: debug release
+	$(PYTHON) scripts/create_release_archive.py \
+		build/Release/$(PROJECT).kext \
+		build/package/$(PROJECT)-$(VERSION)-Release.zip
+	$(PYTHON) scripts/create_release_archive.py \
+		build/Debug/$(PROJECT).kext \
+		build/package/$(PROJECT)-$(VERSION)-Debug.zip
 
 package-internal: check symbols
 	@rm -rf build/package/$(PROJECT)-$(VERSION)$(PACKAGE_SUFFIX)

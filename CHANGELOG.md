@@ -1,5 +1,78 @@
 # Changelog
 
+## 0.0.2 - 2026-07-29
+
+### Menu bar application
+
+- Added the native `RealtekRTL8822CMenu.app` status item with operational
+  state, Wi-Fi on/off control, scanning, available-network selection,
+  disconnect, signal display, and status-aware menu bar icons.
+- Added the project application icon and a lightweight four-level menu bar
+  signal indicator sourced from received-frame RSSI. Connecting and scanning
+  use an intentionally empty Wi-Fi glyph until the link is confirmed.
+- Connected scans now retain recently observed BSS entries for five minutes
+  instead of replacing the whole list from one short passive sweep. This avoids
+  intermittent cross-band omissions without multiplying channel switches.
+  Connection commands still require that the selected entry was seen during
+  the last ten seconds, and a full cache evicts its oldest non-current entry.
+- Menu opening shows cached results immediately and starts a background scan
+  only when the previous attempt is at least 15 seconds old. Scan results are
+  applied once after the sweep, even if the menu remains open, instead of
+  rebuilding it for every received network. The scan item visibly changes to
+  **Searching…** and rejects duplicate commands. Periodic status refreshes
+  update the status icon without rebuilding an open menu.
+- Removed the scan-time 20-ms channel-switch busy wait that is absent from the
+  Linux RTL8822C path. Equivalent passive observation time is provided by the
+  asynchronous dwell timer, and scan-only channel/TX-power diagnostics are
+  suppressed.
+- Reduced menu-app Keychain traffic: RSSI publication is rate-limited, session
+  credentials are reused, and non-authentication failures no longer delete a
+  valid saved password.
+- Added a native macOS **Launch at Login** toggle without a helper daemon.
+- Added secure WPA2 password prompting and per-SSID storage in the macOS user
+  Keychain. Open networks connect without a credential prompt.
+- Added a Debug-only diagnostic window with refresh and copy controls. The
+  Release app contains neither the Debug menu item nor `Debug_*` report keys.
+
+### Driver control boundary
+
+- Added a fixed-size, versioned `IOUserClient` command protocol for status
+  refresh, scan, connect, disconnect, and interface power state.
+- Restricted the user client to the active local user and limited it to the
+  explicit Wi-Fi command set; it exposes no memory mappings or arbitrary
+  register access.
+- Added an explicit user-disabled interface latch so BSD `IFF_UP` reconciliation
+  cannot silently turn Wi-Fi back on after the menu app disables it.
+- Updated `rtl8822cctl` to use the same non-root command path and added `on` and
+  `off` commands.
+
+### Stability and performance
+
+- Preserved the Linux RTL8822C PCI queue stop/wake thresholds while separating
+  temporary BEQ pressure from permanent TX preparation errors. Only real ring
+  pressure is retried; invalid or no-longer-valid packets cannot poison the
+  independent output queue.
+- Removed the obsolete fabricated-BSSID fallback from the TX path and tightened
+  command-specific user-client validation.
+- Propagated scan programming failures, cancellation, and timeout states to the
+  CLI and menu application instead of reporting an accepted asynchronous
+  command as completed.
+- Runtime-confirmed the Release candidate through scanning, WPA2 connection,
+  reconnect, sustained bidirectional traffic, interface control, and
+  sleep/wake with stable traffic delivery.
+- Documented the remaining known issue where the built-in touchpad can briefly
+  lag during network scanning or connection on the reference system.
+- Confirmed that AppleVTD/IOMMU is optional for this driver on the reference
+  system. Operation was validated without IOMMU and with DMA protection
+  enabled; platform policy remains user-specific.
+
+### Build and packaging
+
+- Added reproducible Debug and Release app bundles under `build/`, ad-hoc
+  signing for local execution, app profile-separation checks, and an app-only
+  GitHub Release archive. The v0.0.2 release assets comprise Release and Debug
+  kext archives plus the standalone menu application archive.
+
 ## 0.0.1 - 2026-07-28
 
 First public release for Realtek RTL8822CE `10ec:c822` on x86_64 macOS 15.
@@ -56,8 +129,9 @@ First public release for Realtek RTL8822CE `10ec:c822` on x86_64 macOS 15.
 
 ### Supported release boundary
 
-- Reference hardware: RTL8822CE cut D on x86_64 macOS 15 with OpenCore and
-  AppleVTD/IOMMU enabled.
+- Reference hardware: RTL8822CE cut D on x86_64 macOS 15 with OpenCore. IOMMU
+  state is not a driver requirement and should be selected for platform
+  compatibility.
 - 5 GHz TX is restricted to channels 36/40/44/48 and 149/153/157/161/165 with
   valid board EFUSE power data. DFS is not supported.
 - WPA1/TKIP, WPA3/SAE, Enterprise authentication, PMF, Apple wireless services,

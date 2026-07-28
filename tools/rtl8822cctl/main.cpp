@@ -10,6 +10,9 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 
+#include "RTL8822CClient.h"
+#include "RTL8822CUserClientShared.h"
+
 #ifndef RTW_VERSION
 #define RTW_VERSION "0.0.0"
 #endif
@@ -89,7 +92,9 @@ static void printUsage(std::ostream& out) {
         << "  rtl8822cctl report              Display the complete diagnostic report\n"
         << "  rtl8822cctl scan                Trigger a wireless scan\n"
         << "  rtl8822cctl connect <SSID> [pw|--ask-password] Connect; prompts when password is omitted\n"
-        << "  rtl8822cctl disconnect          Disconnect from the current network\n";
+        << "  rtl8822cctl disconnect          Disconnect from the current network\n"
+        << "  rtl8822cctl on                  Enable the driver Wi-Fi interface\n"
+        << "  rtl8822cctl off                 Disable the driver Wi-Fi interface\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -103,7 +108,8 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     if (cmd != "status" && cmd != "report" && cmd != "scan" &&
-        cmd != "connect" && cmd != "disconnect") {
+        cmd != "connect" && cmd != "disconnect" &&
+        cmd != "on" && cmd != "off") {
         std::cerr << "Unknown command: " << cmd << "\n";
         printUsage(std::cerr);
         return 64;
@@ -124,10 +130,7 @@ int main(int argc, char* argv[]) {
 
     if (cmd == "status" || cmd == "report") {
         // Send UpdateStatus command to driver first to refresh register values
-        CFMutableDictionaryRef updateDict = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-        CFDictionarySetValue(updateDict, CFSTR("Command"), CFSTR("UpdateStatus"));
-        IORegistryEntrySetCFProperties(service, updateDict);
-        CFRelease(updateDict);
+        RTWClientSendCommand(kRTL8822CUserCommandUpdateStatus, "", "", 0);
         CFMutableDictionaryRef properties = nullptr;
         kern_return_t kr = IORegistryEntryCreateCFProperties(service, &properties, kCFAllocatorDefault, 0);
         if (kr != kIOReturnSuccess || !properties) {
@@ -281,11 +284,8 @@ int main(int argc, char* argv[]) {
 
         CFRelease(properties);
     } else if (cmd == "scan") {
-        CFMutableDictionaryRef cmdDict = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-        CFDictionarySetValue(cmdDict, CFSTR("Command"), CFSTR("Scan"));
-
-        kern_return_t kr = IORegistryEntrySetCFProperties(service, cmdDict);
-        CFRelease(cmdDict);
+        kern_return_t kr = RTWClientSendCommand(
+            kRTL8822CUserCommandScan, "", "", 0);
 
         if (kr == kIOReturnSuccess) {
             std::string state;
@@ -316,7 +316,8 @@ int main(int argc, char* argv[]) {
                 std::cout << "Scan command successfully completed.\n";
             }
         } else {
-            std::cerr << "Failed to send Scan command. Error: 0x" << std::hex << kr << std::dec << " (Are you running with sudo?)\n";
+            std::cerr << "Failed to send Scan command. Error: 0x" << std::hex
+                      << kr << std::dec << ". The v0.0.2 or newer driver is required.\n";
             IOObjectRelease(service);
             return 2;
         }
@@ -343,19 +344,8 @@ int main(int argc, char* argv[]) {
             pwd = argv[3];
         }
 
-        CFMutableDictionaryRef cmdDict = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-        CFDictionarySetValue(cmdDict, CFSTR("Command"), CFSTR("Connect"));
-
-        CFStringRef cfSsid = CFStringCreateWithCString(kCFAllocatorDefault, ssid.c_str(), kCFStringEncodingUTF8);
-        CFDictionarySetValue(cmdDict, CFSTR("SSID"), cfSsid);
-        CFRelease(cfSsid);
-
-        CFStringRef cfPwd = CFStringCreateWithCString(kCFAllocatorDefault, pwd.c_str(), kCFStringEncodingUTF8);
-        CFDictionarySetValue(cmdDict, CFSTR("Password"), cfPwd);
-        CFRelease(cfPwd);
-
-        kern_return_t kr = IORegistryEntrySetCFProperties(service, cmdDict);
-        CFRelease(cmdDict);
+        kern_return_t kr = RTWClientSendCommand(
+            kRTL8822CUserCommandConnect, ssid.c_str(), pwd.c_str(), 0);
         std::fill(pwd.begin(), pwd.end(), '\0');
 
         if (kr == kIOReturnSuccess) {
@@ -382,15 +372,26 @@ int main(int argc, char* argv[]) {
             return 2;
         }
     } else if (cmd == "disconnect") {
-        CFMutableDictionaryRef cmdDict = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-        CFDictionarySetValue(cmdDict, CFSTR("Command"), CFSTR("Disconnect"));
-        kern_return_t kr = IORegistryEntrySetCFProperties(service, cmdDict);
-        CFRelease(cmdDict);
+        kern_return_t kr = RTWClientSendCommand(
+            kRTL8822CUserCommandDisconnect, "", "", 0);
 
         if (kr == kIOReturnSuccess) {
             std::cout << "Disconnect command successfully sent to RealtekRTL8822C.\n";
         } else {
             std::cerr << "Failed to send Disconnect command. Error: 0x" << std::hex << kr << std::dec << "\n";
+            IOObjectRelease(service);
+            return 2;
+        }
+    } else if (cmd == "on" || cmd == "off") {
+        const bool enabled = cmd == "on";
+        kern_return_t kr = RTWClientSendCommand(
+            kRTL8822CUserCommandSetInterfaceEnabled, "", "", enabled ? 1 : 0);
+        if (kr == kIOReturnSuccess) {
+            std::cout << "Wi-Fi interface " << (enabled ? "enabled" : "disabled")
+                      << ".\n";
+        } else {
+            std::cerr << "Failed to change Wi-Fi interface state. Error: 0x"
+                      << std::hex << kr << std::dec << "\n";
             IOObjectRelease(service);
             return 2;
         }

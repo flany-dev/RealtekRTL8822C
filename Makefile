@@ -22,6 +22,14 @@ KEXT_BIN_DIR := $(KEXT_CONTENTS)/MacOS
 KEXT_BINARY := $(KEXT_BIN_DIR)/$(PROJECT)
 DSYM_DIR := $(BUILD_ROOT)/$(PROJECT).dSYM
 RTL8822CCTL := $(BUILD_ROOT)/rtl8822cctl
+APP_NAME := RealtekRTL8822CMenu
+APP_DIR := $(BUILD_ROOT)/$(APP_NAME).app
+APP_CONTENTS := $(APP_DIR)/Contents
+APP_BIN_DIR := $(APP_CONTENTS)/MacOS
+APP_RESOURCES_DIR := $(APP_CONTENTS)/Resources
+APP_BINARY := $(APP_BIN_DIR)/$(APP_NAME)
+APP_ICON := app/Assets/AppIcon.icns
+APP_BRIDGE_OBJECT := $(OBJ_DIR)/RTL8822CClient.o
 FIRMWARE := firmware/rtw8822c_fw.bin
 FIRMWARE_HEADER := $(GENERATED_DIR)/rtw8822c_fw.h
 FIRMWARE_SHA256 := 3deecb31210986d98cdbfb000391e08d602a6eee4ffc883969faa2b907ab03ba
@@ -48,9 +56,13 @@ C_COMMON := $(KERNEL_COMMON) -x c
 ifeq ($(CONFIG),Debug)
 KERNEL_PROFILE_FLAGS := -O0 -g -DRTW_DEBUG=1
 TOOL_PROFILE_FLAGS := -O0 -g -DRTW_DEBUG=1
+APP_PROFILE_FLAGS := -Onone -g -D RTW_APP_DEBUG
+APP_BRIDGE_DEFINES := -DRTW_APP_DEBUG=1
 else
 KERNEL_PROFILE_FLAGS := -O2 -g -DNDEBUG -DRTW_DEBUG=0
 TOOL_PROFILE_FLAGS := -O2 -DNDEBUG -DRTW_DEBUG=0
+APP_PROFILE_FLAGS := -O
+APP_BRIDGE_DEFINES := -DRTW_APP_DEBUG=0
 endif
 
 CXXFLAGS := $(CXX_COMMON) $(KERNEL_PROFILE_FLAGS) -DRTW_VERSION=\"$(VERSION)\"
@@ -62,17 +74,17 @@ DRIVER_OBJECTS := $(OBJ_DIR)/RealtekRTL8822C.o $(OBJ_DIR)/RtwWpaCrypto.o \
 	$(OBJ_DIR)/RealtekRTL8822C_info.o
 DEPENDENCIES := $(DRIVER_OBJECTS:.o=.d)
 
-.PHONY: all debug release tools symbols check privacy-check format-check dma-cache-policy-check release-surface-check profile-check tables-check \
+.PHONY: all debug release tools app symbols check privacy-check format-check dma-cache-policy-check release-surface-check profile-check tables-check \
 	test host-sanitizers reproducibility-check release-check package package-local \
-	package-internal package-kexts verify-publication clean distclean verify-env
+	package-internal package-kexts package-app verify-publication clean distclean verify-env
 
 all: verify-env $(KEXT_BINARY)
 
 debug:
-	$(MAKE) CONFIG=Debug all tools
+	$(MAKE) CONFIG=Debug all tools app
 
 release:
-	$(MAKE) CONFIG=Release all tools symbols
+	$(MAKE) CONFIG=Release all tools app symbols
 
 verify-env:
 	@test -f VERSION || { echo "missing VERSION"; exit 1; }
@@ -111,15 +123,42 @@ $(DSYM_DIR): $(KEXT_BINARY)
 
 tools: $(RTL8822CCTL)
 
-$(RTL8822CCTL): tools/rtl8822cctl/main.cpp VERSION
+app: $(APP_BINARY)
+
+$(RTL8822CCTL): tools/rtl8822cctl/main.cpp $(APP_BRIDGE_OBJECT) \
+		app/bridge/RTL8822CClient.h include/RTL8822CUserClientShared.h VERSION
 	@mkdir -p $(BUILD_ROOT)
-	$(CXX) -std=c++14 -Wall -Wextra -Wpedantic -Werror $(TOOL_PROFILE_FLAGS) \
-		-DRTW_VERSION=\"$(VERSION)\" $< \
+	$(CXX) -target $(ARCH)-apple-macos$(MACOS_MIN) -arch $(ARCH) \
+		-isysroot $(SDK_PATH) -std=c++14 -Wall -Wextra -Wpedantic -Werror $(TOOL_PROFILE_FLAGS) \
+		-Iinclude -Iapp/bridge -DRTW_VERSION=\"$(VERSION)\" $< \
+		$(APP_BRIDGE_OBJECT) \
 		-framework CoreFoundation -framework IOKit -o $@
 
-check: all tools
+$(APP_BRIDGE_OBJECT): app/bridge/RTL8822CClient.c \
+		app/bridge/RTL8822CClient.h include/RTL8822CUserClientShared.h
+	@mkdir -p $(OBJ_DIR)
+	$(CC) -target $(ARCH)-apple-macos$(MACOS_MIN) -arch $(ARCH) \
+		-isysroot $(SDK_PATH) -Iinclude -Iapp/bridge \
+		$(APP_BRIDGE_DEFINES) -Wall -Wextra -Wpedantic -Werror -c $< -o $@
+
+$(APP_BINARY): app/RealtekRTL8822CMenu.swift app/Info.plist $(APP_ICON) \
+		$(APP_BRIDGE_OBJECT) VERSION
+	@mkdir -p $(APP_BIN_DIR) $(APP_RESOURCES_DIR)
+	sed 's/@VERSION@/$(VERSION)/g' app/Info.plist > $(APP_CONTENTS)/Info.plist
+	cp $(APP_ICON) $(APP_RESOURCES_DIR)/AppIcon.icns
+	xcrun swiftc -parse-as-library -target $(ARCH)-apple-macos$(MACOS_MIN) -sdk $(SDK_PATH) \
+		$(APP_PROFILE_FLAGS) $< $(APP_BRIDGE_OBJECT) \
+		-framework AppKit -framework Foundation -framework Security \
+		-framework ServiceManagement \
+		-framework CoreFoundation -framework IOKit -o $@
+	chmod -R 755 $(APP_DIR)
+	codesign --force --sign - --timestamp=none $(APP_DIR)
+
+check: all tools app
 	plutil -lint $(KEXT_CONTENTS)/Info.plist
+	plutil -lint $(APP_CONTENTS)/Info.plist
 	@test "`/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' $(KEXT_CONTENTS)/Info.plist`" = "$(VERSION)"
+	@test "`/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' $(APP_CONTENTS)/Info.plist`" = "$(VERSION)"
 	@shasum -a 256 $(FIRMWARE) | grep -q '^$(FIRMWARE_SHA256) '
 	@shasum -a 256 $(FIRMWARE_LICENCE) | grep -q '^$(FIRMWARE_LICENCE_SHA256) '
 	$(MAKE) privacy-check
@@ -181,6 +220,9 @@ test: debug release privacy-check format-check dma-cache-policy-check
 	$(CXX) -std=c++14 -Wall -Wextra -Wpedantic -Werror \
 		tests/protocol_validation_model.cpp -o build/Tests/protocol_validation_model
 	build/Tests/protocol_validation_model
+	$(CXX) -std=c++14 -Wall -Wextra -Wpedantic -Werror -Iinclude \
+		tests/user_client_model.cpp -o build/Tests/user_client_model
+	build/Tests/user_client_model
 	$(CXX) -std=c++14 -Wall -Wextra -Wpedantic -Werror -DRTW_WPA_USERSPACE \
 		-Iinclude src/RtwWpaCrypto.cpp tests/wpa_crypto_test.cpp \
 		-o build/Tests/wpa_crypto
@@ -225,6 +267,7 @@ package-local:
 package: verify-publication
 	$(MAKE) CONFIG=Release PACKAGE_SUFFIX= package-internal
 	$(MAKE) package-kexts
+	$(MAKE) package-app
 
 package-kexts: debug release
 	$(PYTHON) scripts/create_release_archive.py \
@@ -234,22 +277,30 @@ package-kexts: debug release
 		build/Debug/$(PROJECT).kext \
 		build/package/$(PROJECT)-$(VERSION)-Debug.zip
 
+package-app: release
+	$(PYTHON) scripts/create_release_archive.py \
+		build/Release/$(APP_NAME).app \
+		build/package/$(APP_NAME)-$(VERSION).zip
+
 package-internal: check symbols
 	@rm -rf build/package/$(PROJECT)-$(VERSION)$(PACKAGE_SUFFIX)
 	@mkdir -p build/package/$(PROJECT)-$(VERSION)$(PACKAGE_SUFFIX)
 	ditto $(KEXT_DIR) build/package/$(PROJECT)-$(VERSION)$(PACKAGE_SUFFIX)/$(PROJECT).kext
 	ditto $(RTL8822CCTL) build/package/$(PROJECT)-$(VERSION)$(PACKAGE_SUFFIX)/rtl8822cctl
+	ditto $(APP_DIR) build/package/$(PROJECT)-$(VERSION)$(PACKAGE_SUFFIX)/$(APP_NAME).app
 	@if [ -d "$(DSYM_DIR)" ]; then \
 		mkdir -p build/package/$(PROJECT)-$(VERSION)$(PACKAGE_SUFFIX)/Symbols; \
 		ditto $(DSYM_DIR) \
 			build/package/$(PROJECT)-$(VERSION)$(PACKAGE_SUFFIX)/Symbols/$(PROJECT).dSYM; \
 	fi
-	ditto README.md LICENSE THIRD_PARTY_NOTICES.md CHANGELOG.md SECURITY.md \
+	ditto README.md RELEASE_NOTES.md LICENSE THIRD_PARTY_NOTICES.md CHANGELOG.md SECURITY.md \
 		CODE_OF_CONDUCT.md CONTRIBUTING.md ROADMAP.md \
 		build/package/$(PROJECT)-$(VERSION)$(PACKAGE_SUFFIX)/
 	@mkdir -p build/package/$(PROJECT)-$(VERSION)$(PACKAGE_SUFFIX)/docs
 	ditto docs/RTL8822CCTL.md \
 		build/package/$(PROJECT)-$(VERSION)$(PACKAGE_SUFFIX)/docs/RTL8822CCTL.md
+	ditto docs/MENU_APP.md \
+		build/package/$(PROJECT)-$(VERSION)$(PACKAGE_SUFFIX)/docs/MENU_APP.md
 	ditto docs/HARDWARE_ACCEPTANCE.md \
 		build/package/$(PROJECT)-$(VERSION)$(PACKAGE_SUFFIX)/docs/HARDWARE_ACCEPTANCE.md
 	@mkdir -p build/package/$(PROJECT)-$(VERSION)$(PACKAGE_SUFFIX)/firmware
@@ -257,7 +308,7 @@ package-internal: check symbols
 		build/package/$(PROJECT)-$(VERSION)$(PACKAGE_SUFFIX)/firmware/README.md
 	ditto $(FIRMWARE_LICENCE) \
 		build/package/$(PROJECT)-$(VERSION)$(PACKAGE_SUFFIX)/firmware/LICENCE.rtlwifi_firmware.txt
-	sh scripts/create_manifest.sh $(VERSION) $(KEXT_DIR) $(RTL8822CCTL) \
+	sh scripts/create_manifest.sh $(VERSION) $(KEXT_DIR) $(RTL8822CCTL) $(APP_DIR) \
 		build/package/$(PROJECT)-$(VERSION)$(PACKAGE_SUFFIX)/MANIFEST.txt
 	$(PYTHON) scripts/create_release_archive.py \
 		build/package/$(PROJECT)-$(VERSION)$(PACKAGE_SUFFIX) \

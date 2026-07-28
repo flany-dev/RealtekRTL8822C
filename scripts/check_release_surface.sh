@@ -5,9 +5,15 @@ project=RealtekRTL8822C
 bundle_id=org.realtekrtl8822c.driver.RealtekRTL8822C
 
 for path in \
+    RELEASE_NOTES.md \
     src/RealtekRTL8822C.cpp \
     src/RealtekRTL8822C_info.c \
     tools/rtl8822cctl/main.cpp \
+    app/RealtekRTL8822CMenu.swift \
+    app/Info.plist \
+    app/bridge/RTL8822CClient.c \
+    include/RTL8822CUserClientShared.h \
+    docs/MENU_APP.md \
     docs/RTL8822CCTL.md; do
     test -f "$path" || { echo "release surface missing: $path" >&2; exit 1; }
 done

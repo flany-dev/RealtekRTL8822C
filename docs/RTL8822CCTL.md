@@ -11,11 +11,19 @@ rtl8822cctl report
 rtl8822cctl scan
 rtl8822cctl connect <ssid> [password|--ask-password]
 rtl8822cctl disconnect
+rtl8822cctl on
+rtl8822cctl off
 ```
 
-Commands that change driver state normally require root privileges. A failure
-such as `0xe00002c7` usually means the process lacks permission to update the
-driver service.
+With the v0.0.2 or newer kext, commands use the versioned RTL8822C local-user
+client and do not require root privileges. The user client accepts only status,
+scan, connect, disconnect, and interface-state commands; it exposes no DMA
+memory or register access. A command failure against an older kext normally
+means the required user-client protocol is unavailable.
+
+`rtl8822cctl off` disables the driver Wi-Fi interface and disconnects the
+current network without changing EFI or unloading the kext. `rtl8822cctl on`
+enables it again; select a network afterward to reconnect.
 
 `rtl8822cctl scan` is synchronous while disconnected. While connected, the driver
 uses a bounded asynchronous off-channel sweep and the utility waits for the

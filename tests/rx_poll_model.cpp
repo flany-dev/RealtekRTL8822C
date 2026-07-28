@@ -9,6 +9,17 @@ struct PollResult {
     std::uint32_t budgetHits;
 };
 
+enum class EnqueueResult {
+    Success,
+    RingFull,
+    InvalidFrame,
+    NotReady
+};
+
+static bool mustRetainPacket(EnqueueResult result) {
+    return result == EnqueueResult::RingFull;
+}
+
 static PollResult drain(std::uint32_t pending, std::uint32_t budget) {
     PollResult result{};
     bool rxMasked = pending != 0U;
@@ -69,5 +80,13 @@ int main() {
     bool synchronousDrainOnRxLoop = false;
     assert(asynchronousServiceRequested);
     assert(!synchronousDrainOnRxLoop);
+
+    // Only resource pressure is retryable. Treating a malformed packet or a
+    // permanently unavailable TX path as OutputStall poisons the head of an
+    // IOBasicOutputQueue and retries the same mbuf forever.
+    assert(mustRetainPacket(EnqueueResult::RingFull));
+    assert(!mustRetainPacket(EnqueueResult::InvalidFrame));
+    assert(!mustRetainPacket(EnqueueResult::NotReady));
+    assert(!mustRetainPacket(EnqueueResult::Success));
     return 0;
 }

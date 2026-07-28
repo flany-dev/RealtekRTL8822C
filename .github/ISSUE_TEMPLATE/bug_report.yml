@@ -10,7 +10,7 @@ body:
     id: version
     attributes:
       label: Driver version and configuration
-      placeholder: 0.0.1 Debug or Release
+      placeholder: 0.0.2 Debug or Release
     validations:
       required: true
   - type: input

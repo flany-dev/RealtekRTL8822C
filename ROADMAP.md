@@ -29,8 +29,8 @@ The first-release engineering and documentation gates are complete:
 - [x] Public documentation, contribution and security policies, firmware
   licence, third-party notices, issue templates, and macOS x86_64 CI.
 
-Creating the Git repository, publishing it, and tagging `v0.0.1` are owner
-release operations and are intentionally not performed by the build system.
+The repository publication and `v0.0.1` tag were completed as explicit owner
+release operations outside the build system.
 
 ## Known v0.0.1 boundaries
 
@@ -44,7 +44,28 @@ release operations and are intentionally not performed by the build system.
 These are documented compatibility boundaries, not open v0.0.1 release
 blockers.
 
-## Post-v0.0.1
+## v0.0.2 — complete, publication pending
+
+- [x] Native macOS menu bar application with Wi-Fi state and network list.
+- [x] Scan, connect, disconnect, and Wi-Fi on/off actions.
+- [x] WPA2 credential prompt and macOS Keychain storage.
+- [x] Native Launch at Login control.
+- [x] Versioned local-user `IOUserClient`; no `sudo` or privileged helper.
+- [x] Explicit user-disabled latch resistant to BSD `IFF_UP` reconciliation.
+- [x] Debug-only diagnostic window and log-free/diagnostic-free Release UI.
+- [x] Debug/Release app builds and app-only release packaging.
+- [x] Application icon, pending-link glyph, and lightweight RSSI levels.
+- [x] Bounded connected-scan cache across 2.4 and 5 GHz.
+- [x] Runtime validation of non-root commands, password flow, repeated on/off,
+  reconnect, connected scan, and sleep/wake with the menu app running.
+- [x] Stable sustained bidirectional traffic and final TX/error-path audit.
+- [x] Final v0.0.2 release audit, reproducible packaging, and release assets.
+
+Publishing the GitHub Release and tagging `v0.0.2` are owner operations and are
+intentionally not performed by the build system or automated agents without
+explicit approval.
+
+## Post-v0.0.2
 
 - Expand the RTL8822CE laptop, AP, macOS, bandwidth, and sleep/wake matrix.
 - Add a trustworthy regulatory-domain source before broadening channel policy.

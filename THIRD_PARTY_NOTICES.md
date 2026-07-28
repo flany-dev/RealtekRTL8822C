@@ -1,7 +1,7 @@
 # Third-Party Notices
 
 This file records the provenance and redistribution status of code and binary
-components used by RealtekRTL8822C v0.0.1.
+components used by RealtekRTL8822C v0.0.2.
 
 ## Linux rtw88
 

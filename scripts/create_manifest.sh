@@ -1,17 +1,19 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -ne 4 ]; then
-    echo "usage: $0 <version> <kext> <rtl8822cctl> <output>" >&2
+if [ "$#" -ne 5 ]; then
+    echo "usage: $0 <version> <kext> <rtl8822cctl> <menu-app> <output>" >&2
     exit 64
 fi
 
 version=$1
 kext=$2
 rtl8822cctl=$3
-output=$4
+menu_app=$4
+output=$5
 kext_binary="$kext/Contents/MacOS/RealtekRTL8822C"
 dsym_binary="$(dirname "$kext")/RealtekRTL8822C.dSYM/Contents/Resources/DWARF/RealtekRTL8822C"
+menu_binary="$menu_app/Contents/MacOS/RealtekRTL8822CMenu"
 
 {
     echo "RealtekRTL8822C build manifest"
@@ -29,6 +31,7 @@ dsym_binary="$(dirname "$kext")/RealtekRTL8822C.dSYM/Contents/Resources/DWARF/Re
         echo "dsym_binary_sha256=$(shasum -a 256 "$dsym_binary" | awk '{print $1}')"
     fi
     echo "rtl8822cctl_sha256=$(shasum -a 256 "$rtl8822cctl" | awk '{print $1}')"
+    echo "menu_app_binary_sha256=$(shasum -a 256 "$menu_binary" | awk '{print $1}')"
     echo "compiler=$(clang --version | sed -n '1p')"
     echo "sdk=$(xcrun --sdk macosx --show-sdk-version)"
 } > "$output"

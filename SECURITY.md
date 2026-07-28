@@ -2,7 +2,7 @@
 
 ## Supported version
 
-Security fixes target the current `0.0.1` release line. Older development
+Security fixes target the current `0.0.2` release line. Older development
 artifacts and locally modified builds are not supported.
 
 ## Reporting

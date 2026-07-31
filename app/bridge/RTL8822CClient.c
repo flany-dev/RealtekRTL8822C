@@ -22,6 +22,55 @@ static io_service_t RTWCopyService(void) {
     return IOServiceGetMatchingService(kIOMainPortDefault, matching);
 }
 
+static bool RTWCopyPCIIdentifier(io_registry_entry_t entry, CFStringRef key,
+                                 uint32_t* identifier) {
+    CFTypeRef value = IORegistryEntryCreateCFProperty(
+        entry, key, kCFAllocatorDefault, 0);
+    if (!value) return false;
+    bool copied = false;
+    if (CFGetTypeID(value) == CFDataGetTypeID() &&
+        CFDataGetLength((CFDataRef)value) >= (CFIndex)sizeof(uint32_t)) {
+        memcpy(identifier, CFDataGetBytePtr((CFDataRef)value), sizeof(uint32_t));
+        copied = true;
+    } else if (CFGetTypeID(value) == CFNumberGetTypeID()) {
+        copied = CFNumberGetValue((CFNumberRef)value, kCFNumberSInt32Type,
+                                  identifier);
+    }
+    CFRelease(value);
+    return copied;
+}
+
+uint32_t RTWClientGetAvailability(void) {
+    io_service_t driver = RTWCopyService();
+    if (driver) {
+        IOObjectRelease(driver);
+        return 2U;
+    }
+
+    CFMutableDictionaryRef matching = IOServiceMatching("IOPCIDevice");
+    if (!matching) return 0U;
+    io_iterator_t iterator = IO_OBJECT_NULL;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) !=
+        kIOReturnSuccess) return 0U;
+
+    bool compatible = false;
+    io_registry_entry_t entry;
+    while ((entry = IOIteratorNext(iterator)) != IO_OBJECT_NULL) {
+        uint32_t vendor = 0;
+        uint32_t device = 0;
+        if (RTWCopyPCIIdentifier(entry, CFSTR("vendor-id"), &vendor) &&
+            RTWCopyPCIIdentifier(entry, CFSTR("device-id"), &device) &&
+            (vendor & 0xffffU) == 0x10ecU && (device & 0xffffU) == 0xc822U) {
+            compatible = true;
+            IOObjectRelease(entry);
+            break;
+        }
+        IOObjectRelease(entry);
+    }
+    IOObjectRelease(iterator);
+    return compatible ? 1U : 0U;
+}
+
 static void RTWSecureZero(void* pointer, size_t size) {
     volatile unsigned char* bytes = (volatile unsigned char*)pointer;
     while (size--) *bytes++ = 0;
@@ -52,6 +101,83 @@ int32_t RTWClientSendCommand(uint32_t command, const char* ssid,
     RTWSecureZero(&request, sizeof(request));
     IOServiceClose(connection);
     return result;
+}
+
+static bool RTWAppendJSON(char* output, size_t capacity, size_t* used,
+                          const char* value) {
+    size_t length = strlen(value);
+    if (*used + length + 1 > capacity) return false;
+    memcpy(output + *used, value, length);
+    *used += length;
+    output[*used] = '\0';
+    return true;
+}
+
+int32_t RTWClientCopyScanSnapshotJSON(char* output, size_t outputCapacity) {
+    if (!output || outputCapacity == 0) return kIOReturnBadArgument;
+    output[0] = '\0';
+
+    io_service_t service = RTWCopyService();
+    if (!service) return kIOReturnNotFound;
+    io_connect_t connection = IO_OBJECT_NULL;
+    kern_return_t result = IOServiceOpen(
+        service, mach_task_self(), RTL8822C_USER_CLIENT_TYPE, &connection);
+    IOObjectRelease(service);
+    if (result != kIOReturnSuccess) return result;
+
+    struct RTL8822CUserClientScanSnapshot snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    size_t snapshotSize = sizeof(snapshot);
+    result = IOConnectCallStructMethod(
+        connection, kRTL8822CUserClientSelectorScanSnapshot,
+        NULL, 0, &snapshot, &snapshotSize);
+    IOServiceClose(connection);
+    if (result != kIOReturnSuccess) return result;
+    if (snapshotSize != sizeof(snapshot) ||
+        snapshot.version != RTL8822C_USER_CLIENT_PROTOCOL_VERSION ||
+        snapshot.entrySize != sizeof(struct RTL8822CUserClientScanEntry) ||
+        snapshot.count > RTL8822C_SCAN_SNAPSHOT_MAX_ENTRIES) {
+        return kIOReturnBadMessageID;
+    }
+
+    size_t used = 0;
+    char header[96];
+    snprintf(header, sizeof(header), "{\"version\":%u,\"generation\":%u,\"entries\":[",
+             snapshot.version, snapshot.generation);
+    if (!RTWAppendJSON(output, outputCapacity, &used, header))
+        return kIOReturnNoSpace;
+
+    for (uint32_t index = 0; index < snapshot.count; index++) {
+        const struct RTL8822CUserClientScanEntry* entry = &snapshot.entries[index];
+        if (entry->ssidLength > 32 || entry->reserved != 0) return kIOReturnBadMessageID;
+        char prefix[320];
+        snprintf(prefix, sizeof(prefix),
+                 "%s{\"bssid\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"ssidHex\":\"",
+                 index == 0 ? "" : ",",
+                 entry->bssid[0], entry->bssid[1], entry->bssid[2],
+                 entry->bssid[3], entry->bssid[4], entry->bssid[5]);
+        if (!RTWAppendJSON(output, outputCapacity, &used, prefix))
+            return kIOReturnNoSpace;
+        for (uint8_t byteIndex = 0; byteIndex < entry->ssidLength; byteIndex++) {
+            char byteText[3];
+            snprintf(byteText, sizeof(byteText), "%02x",
+                     (unsigned char)entry->ssid[byteIndex]);
+            if (!RTWAppendJSON(output, outputCapacity, &used, byteText))
+                return kIOReturnNoSpace;
+        }
+        char suffix[384];
+        snprintf(suffix, sizeof(suffix),
+                 "\",\"hidden\":%s,\"security\":%u,\"channel\":%u,\"centerChannel\":%u,\"bandwidth\":%u,\"rssi\":%d,\"flags\":%u,\"ageMs\":%u}",
+                 (entry->flags & kRTL8822CScanEntryHidden) ? "true" : "false",
+                 entry->securityMode, entry->primaryChannel,
+                 entry->centerChannel, entry->bandwidth, entry->rssi,
+                 entry->flags, entry->lastSeenAgeMs);
+        if (!RTWAppendJSON(output, outputCapacity, &used, suffix))
+            return kIOReturnNoSpace;
+    }
+    if (!RTWAppendJSON(output, outputCapacity, &used, "]}"))
+        return kIOReturnNoSpace;
+    return kIOReturnSuccess;
 }
 
 static bool RTWCopyCFValueString(CFTypeRef value, char* output,
@@ -152,6 +278,7 @@ int32_t RTWClientCopyReport(char* output, size_t outputCapacity,
 #endif
         bool isPublic = strcmp(key, "DriverVersion") == 0 ||
                         strcmp(key, "BuildConfiguration") == 0 ||
+                        strcmp(key, "DriverBuildTargetMacOS") == 0 ||
                         strcmp(key, "PowerState") == 0 ||
                         strcmp(key, "InterfaceState") == 0 ||
                         strcmp(key, "InterfaceUserEnabled") == 0 ||
@@ -159,6 +286,18 @@ int32_t RTWClientCopyReport(char* output, size_t outputCapacity,
                         strcmp(key, "WiFiStatus") == 0 ||
                         strcmp(key, "ConnectedSSID") == 0 ||
                         strcmp(key, "SignalStrength") == 0 ||
+                        strcmp(key, "ScanGeneration") == 0 ||
+                        strcmp(key, "ScanState") == 0 ||
+                        strcmp(key, "ConnectionQueueState") == 0 ||
+                        strcmp(key, "ConnectionAttemptID") == 0 ||
+                        strcmp(key, "ConnectionTargetSSID") == 0 ||
+                        strcmp(key, "ConnectionPhase") == 0 ||
+                        strcmp(key, "ConnectionResult") == 0 ||
+                        strcmp(key, "ConnectionFailureCode") == 0 ||
+                        strcmp(key, "LinkEventGeneration") == 0 ||
+                        strcmp(key, "LinkEventType") == 0 ||
+                        strcmp(key, "LinkEventSSID") == 0 ||
+                        strcmp(key, "LinkEventReason") == 0 ||
                         strcmp(key, "ConnectedScanState") == 0 ||
                         strcmp(key, "ScanResults") == 0;
         if ((!includeDebug || !isDebug) && !isPublic) continue;

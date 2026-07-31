@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.0.3 - 2026-07-31
+
+### Scan and network discovery
+
+- Added a fixed-size structured BSS snapshot keyed by BSSID. Hidden BSSes,
+  same-name networks on different bands, security, channel, bandwidth, RSSI,
+  and age are preserved without parsing formatted report text.
+- Unified connected and disconnected scanning under one asynchronous
+  timer-driven state machine with bounded active probes, passive DFS discovery,
+  cancellation, restoration, and generation-based publication.
+- Added directed discovery and **Join Other Network...** for manually entered
+  SSIDs, including hidden Open and WPA2 networks.
+- Added explicit connectable and DFS-required capability flags. Receive-only
+  networks remain visible but cannot reach the TX path.
+
+### Connection and credential lifecycle
+
+- Added structured connection attempt IDs, phases, terminal results, failure
+  codes, scan-time queuing, and cancellation across discovery, authentication,
+  association, and WPA negotiation.
+- Hardened stale attempt handling while retaining standards-compliant
+  Auth/Association and EAPOL retry behavior.
+- Restored complete WPA teardown between attempts, including replay, nonce,
+  PTK/GTK, CAM, and remembered EAPOL state.
+- Added cancellable wrong-password recovery, explicit password replacement and
+  forgetting, and persistence only after successful WPA authorization.
+- Added deduplicated native connection, disconnection, and failure banners.
+
+### Application responsiveness and compatibility
+
+- Moved structured scan snapshot retrieval and decoding off the main UI path,
+  skipped unchanged generations, and guarded asynchronous completions against
+  stale operations.
+- Added persistent disabled presentation for hidden, DFS, and other receive-only
+  BSS rows.
+- Added clear loaded-driver, compatible-hardware/unloaded-kext, and unsupported
+  hardware states.
+- Set the application and CLI deployment target to macOS 12. Debug kext builds
+  now use an experimental macOS 12 deployment target while Release remains at
+  macOS 15.5. Older macOS kext operation is not yet runtime-confirmed.
+- Added compatibility checks for deployment targets, weak-linked macOS 13 APIs,
+  and exact `10ec:c822` matching without subsystem/revision restrictions.
+
+### Validation and packaging
+
+- Runtime-confirmed Debug and Release scanning, Open/WPA2 connection,
+  credential recovery, notifications, sustained traffic, interface control,
+  and sleep/wake on the reference system.
+- Extended host models, profile checks, reproducibility gates, and the existing
+  three-asset release packaging for v0.0.3.
+
 ## 0.0.2 - 2026-07-29
 
 ### Menu bar application
@@ -60,8 +111,6 @@
 - Runtime-confirmed the Release candidate through scanning, WPA2 connection,
   reconnect, sustained bidirectional traffic, interface control, and
   sleep/wake with stable traffic delivery.
-- Documented the remaining known issue where the built-in touchpad can briefly
-  lag during network scanning or connection on the reference system.
 - Confirmed that AppleVTD/IOMMU is optional for this driver on the reference
   system. Operation was validated without IOMMU and with DMA protection
   enabled; platform policy remains user-specific.

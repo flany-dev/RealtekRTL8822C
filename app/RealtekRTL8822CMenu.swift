@@ -5,6 +5,7 @@ import AppKit
 import Foundation
 import Security
 import ServiceManagement
+import UserNotifications
 
 @_silgen_name("RTWClientSendCommand")
 private func RTWClientSendCommand(_ command: UInt32,
@@ -22,18 +23,35 @@ private func RTWClientCopyReport(_ output: UnsafeMutablePointer<CChar>,
                                  _ capacity: Int,
                                  _ includeDebug: UInt32) -> Int32
 
+@_silgen_name("RTWClientCopyScanSnapshotJSON")
+private func RTWClientCopyScanSnapshotJSON(
+    _ output: UnsafeMutablePointer<CChar>, _ capacity: Int) -> Int32
+
+@_silgen_name("RTWClientGetAvailability")
+private func RTWClientGetAvailability() -> UInt32
+
 private enum DriverCommand: UInt32 {
     case updateStatus = 1
     case scan = 2
     case connect = 3
     case disconnect = 4
     case setInterfaceEnabled = 5
+    case directedScan = 6
+    case cancelConnection = 7
 }
 
 private let ioSuccess: Int32 = 0
 private let ioError = Int32(bitPattern: 0xe00002bc)
 private let ioTimeout = Int32(bitPattern: 0xe00002d6)
 private let ioAborted = Int32(bitPattern: 0xe00002eb)
+private let ioNotReady = Int32(bitPattern: 0xe00002d8)
+private let projectReleasesURL = URL(string: "https://github.com/flany-dev/RealtekRTL8822C/releases")!
+
+private enum DriverAvailability: UInt32 {
+    case unsupportedHardware = 0
+    case kextNotLoaded = 1
+    case ready = 2
+}
 
 private func ioReturnDescription(_ value: Int32) -> String {
     let code = String(format: "0x%08x", UInt32(bitPattern: value))
@@ -82,6 +100,15 @@ private final class DriverClient: @unchecked Sendable {
         }
         return String(cString: buffer)
     }
+
+    func scanSnapshot() -> ScanSnapshot? {
+        var buffer = [CChar](repeating: 0, count: 64 * 1024)
+        let result = RTWClientCopyScanSnapshotJSON(&buffer, buffer.count)
+        guard result == ioSuccess else { return nil }
+        let length = buffer.firstIndex(of: 0) ?? buffer.count
+        let data = Data(buffer[0..<length].map { UInt8(bitPattern: $0) })
+        return try? JSONDecoder().decode(ScanSnapshot.self, from: data)
+    }
 }
 
 private enum KeychainStore {
@@ -129,14 +156,70 @@ private enum KeychainStore {
     }
 }
 
+private struct ScanSnapshot: Decodable {
+    let version: UInt32
+    let generation: UInt32
+    let entries: [ScanSnapshotEntry]
+}
+
+private struct ScanSnapshotEntry: Decodable {
+    let bssid: String
+    let ssidHex: String
+    let hidden: Bool
+    let security: UInt8
+    let channel: Int
+    let centerChannel: Int
+    let bandwidth: Int
+    let rssi: Int
+    let flags: UInt8
+    let ageMs: UInt32
+
+    var ssid: String {
+        var bytes: [UInt8] = []
+        var index = ssidHex.startIndex
+        while index < ssidHex.endIndex {
+            let next = ssidHex.index(index, offsetBy: 2,
+                                     limitedBy: ssidHex.endIndex) ??
+                       ssidHex.endIndex
+            guard next > index,
+                  let byte = UInt8(ssidHex[index..<next], radix: 16) else {
+                return ""
+            }
+            bytes.append(byte)
+            index = next
+        }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+}
+
 private struct WirelessNetwork: Equatable {
     let ssid: String
     let securityName: String
     let channel: Int
+    let centerChannel: Int
+    let bandwidth: Int
     let rssi: Int
     let bssid: String
+    let hidden: Bool
+    let ageMs: UInt32
+    let flags: UInt8
 
     var isSecure: Bool { securityName != "Open" }
+    var requiresDfs: Bool {
+        (flags & (1 << 7)) != 0 || (channel >= 52 && channel <= 144)
+    }
+    var isConnectable: Bool {
+        if channel == 0 { return true }
+        if (flags & (1 << 6)) != 0 { return true }
+        // Compatibility with an already-running pre-capability v0.0.3 kext.
+        return (channel >= 1 && channel <= 11) ||
+            [36, 40, 44, 48, 149, 153, 157, 161, 165].contains(channel)
+    }
+    var displayName: String {
+        if !hidden { return ssid }
+        let suffix = bssid.split(separator: ":").suffix(2).joined(separator: ":")
+        return suffix.isEmpty ? "Hidden Network" : "Hidden Network (\(suffix))"
+    }
 }
 
 private final class NetworkBox: NSObject {
@@ -182,39 +265,30 @@ private enum WiFiStatusGlyph {
     }
 }
 
-private func parseScanResults(_ text: String) -> [WirelessNetwork] {
-    let pattern = #"^\s*-\s+(.*?)\s+\((Open|WPA2|WPA),\s*ch=(\d+)\)\s+\[Signal:\s*(-?\d+)dBm,\s*BSSID:\s*([0-9a-fA-F:]+)\]$"#
-    guard let expression = try? NSRegularExpression(pattern: pattern) else {
-        return []
-    }
-    var strongest: [String: WirelessNetwork] = [:]
-    for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-        let value = String(line)
-        let range = NSRange(value.startIndex..<value.endIndex, in: value)
-        guard let match = expression.firstMatch(in: value, range: range),
-              match.numberOfRanges == 6,
-              let ssidRange = Range(match.range(at: 1), in: value),
-              let securityRange = Range(match.range(at: 2), in: value),
-              let channelRange = Range(match.range(at: 3), in: value),
-              let rssiRange = Range(match.range(at: 4), in: value),
-              let bssidRange = Range(match.range(at: 5), in: value),
-              let channel = Int(value[channelRange]),
-              let rssi = Int(value[rssiRange]) else { continue }
-        let network = WirelessNetwork(
-            ssid: String(value[ssidRange]),
-            securityName: String(value[securityRange]),
-            channel: channel,
-            rssi: rssi,
-            bssid: String(value[bssidRange]))
-        guard !network.ssid.isEmpty else { continue }
-        if strongest[network.ssid] == nil ||
-            network.rssi > strongest[network.ssid]!.rssi {
-            strongest[network.ssid] = network
+private func buildWirelessNetworks(from snapshot: ScanSnapshot) -> [WirelessNetwork] {
+    return snapshot.entries.map { entry in
+        let securityName: String
+        switch entry.security {
+            case 2: securityName = "WPA2"
+            case 1: securityName = "WPA"
+            default: securityName = "Open"
         }
-    }
-    return strongest.values.sorted {
+        return WirelessNetwork(
+            ssid: entry.ssid,
+            securityName: securityName,
+            channel: entry.channel,
+            centerChannel: entry.centerChannel,
+            bandwidth: entry.bandwidth,
+            rssi: entry.rssi,
+            bssid: entry.bssid,
+            hidden: entry.hidden,
+            ageMs: entry.ageMs,
+            flags: entry.flags)
+    }.sorted {
         if $0.rssi != $1.rssi { return $0.rssi > $1.rssi }
-        return $0.ssid.localizedCaseInsensitiveCompare($1.ssid) == .orderedAscending
+        let nameOrder = $0.displayName.localizedCaseInsensitiveCompare($1.displayName)
+        if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
+        return $0.bssid < $1.bssid
     }
 }
 
@@ -293,17 +367,27 @@ private final class DebugWindowController: NSWindowController {
 #endif
 
 @MainActor
-private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
+                                 UNUserNotificationCenterDelegate {
     private let client = DriverClient()
     private let statusItem = NSStatusBar.system.statusItem(
         withLength: NSStatusItem.squareLength)
     private let menu = NSMenu()
     private var networks: [WirelessNetwork] = []
+    private var scanGeneration: UInt32 = 0
+    private var scanSnapshotInitialized = false
+    private var scanSnapshotLoadGeneration: UInt64 = 0
+    private var scanSnapshotLoadPending = false
+    private var scanOperationGeneration: UInt64 = 0
+    private var connectionOperationGeneration: UInt64 = 0
+    private var interfaceOperationGeneration: UInt64 = 0
+    private var interfaceOperationPending = false
     private var connectedSSID = ""
     private var wifiEnabled = true
     private var scanRunning = false
     private var statusMessage = "Loading…"
     private var connectionPending = false
+    private var localConnectionCancellationRequested = false
     private var signalStrength: Int?
     private var sessionCredentials: [String: (password: String,
                                                needsSave: Bool)] = [:]
@@ -312,6 +396,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var lastScanCompletedAt: Date?
     private var scanMenuItem: NSMenuItem?
     private var networkMenuItems: [NSMenuItem] = []
+    private var driverAvailability: DriverAvailability = .unsupportedHardware
+    private var linkStateInitialized = false
+    private var previousWiFiStatus = ""
+    private var previousConnectedSSID = ""
+    private var localDisconnectRequested = false
+    private var lastNotificationKey = ""
+    private var lastLinkEventGeneration: UInt32?
+    private var notificationAuthorizationResolved = false
+    private var notificationAuthorizationGranted = false
+    private var pendingNotification: (key: String, title: String, body: String)?
+    private var notificationKeysInFlight: Set<String> = []
+    private var notificationDeliveryError: String?
 #if RTW_APP_DEBUG
     private var debugWindow: DebugWindowController?
 #endif
@@ -321,6 +417,25 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.delegate = self
         statusItem.menu = menu
         statusItem.button?.image = WiFiStatusGlyph.image(level: 0)
+        UNUserNotificationCenter.current().delegate = self
+        UNUserNotificationCenter.current().requestAuthorization(
+            options: [.alert, .sound]) { [weak self] granted, _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.notificationAuthorizationResolved = true
+                self.notificationAuthorizationGranted = granted
+                self.notificationDeliveryError = nil
+                if granted, let pending = self.pendingNotification {
+                    self.pendingNotification = nil
+                    self.postNotification(key: pending.key,
+                                          title: pending.title,
+                                          body: pending.body)
+                } else if !granted {
+                    self.pendingNotification = nil
+                }
+                self.rebuildMenu()
+            }
+        }
         refreshStatus()
         statusTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) {
             [weak self] _ in
@@ -339,7 +454,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         rebuildMenu()
         let scanReference = lastScanCompletedAt ?? lastScanAttemptAt
         let scanAge = scanReference.map { Date().timeIntervalSince($0) }
-        if scanAge == nil || scanAge! >= 15 {
+        if !connectionPending && (scanAge == nil || scanAge! >= 15) {
             startScan()
         }
     }
@@ -349,16 +464,51 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func refreshStatus() {
+        driverAvailability = DriverAvailability(rawValue: RTWClientGetAvailability()) ??
+            .unsupportedHardware
+        guard driverAvailability == .ready else {
+            wifiEnabled = false
+            connectedSSID = ""
+            networks.removeAll(keepingCapacity: true)
+            scanSnapshotInitialized = false
+            scanSnapshotLoadGeneration &+= 1
+            scanSnapshotLoadPending = false
+            connectionPending = false
+            statusMessage = driverAvailability == .kextNotLoaded ?
+                "RTL8822C kext is not loaded" :
+                "RTL8822C hardware is not supported or was not detected"
+            statusItem.button?.image = NSImage(
+                systemSymbolName: "wifi.exclamationmark",
+                accessibilityDescription: statusMessage)
+            statusItem.button?.image?.isTemplate = true
+            statusItem.button?.toolTip = statusMessage
+            return
+        }
         let state = client.property("InterfaceState") ?? "Unavailable"
         let explicit = client.property("InterfaceUserEnabled")
         wifiEnabled = explicit.map { $0 == "true" } ?? (state != "Disabled")
         connectedSSID = client.property("ConnectedSSID") ?? ""
         let wifiStatus = client.property("WiFiStatus") ?? "Unavailable"
+        let connectionResult = client.property("ConnectionResult") ?? "none"
+        let connectionPhase = client.property("ConnectionPhase") ?? "idle"
+        if connectionResult == "pending" { connectionPending = true }
         signalStrength = client.property("SignalStrength").flatMap(Int.init)
-        statusMessage = client.property("DriverStatus") ?? wifiStatus
-        if let results = client.property("ScanResults") {
-            networks = parseScanResults(results)
+        statusMessage = connectionPending ?
+            connectionPhaseDescription(connectionPhase) :
+            (client.property("DriverStatus") ?? wifiStatus)
+        if let generationText = client.property("LinkEventGeneration"),
+           let generation = UInt32(generationText) {
+            handleLinkEvent(generation: generation,
+                            type: client.property("LinkEventType") ?? "unknown",
+                            ssid: client.property("LinkEventSSID") ?? "",
+                            reason: client.property("LinkEventReason") ?? "unknown")
+        } else {
+            if lastLinkEventGeneration == nil { lastLinkEventGeneration = 0 }
+            handleLinkTransition(wifiStatus: wifiStatus, ssid: connectedSSID)
         }
+        let publishedScanGeneration = client.property("ScanGeneration")
+            .flatMap(UInt32.init) ?? scanGeneration
+        refreshScanSnapshotIfNeeded(publishedGeneration: publishedScanGeneration)
 
         let label: String
         if !wifiEnabled {
@@ -370,7 +520,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             statusItem.button?.image = WiFiStatusGlyph.image(level: 0)
         } else if wifiStatus == "Connected" && !connectedSSID.isEmpty {
             label = "Connected to \(connectedSSID)"
-            connectionPending = false
             statusItem.button?.image = WiFiStatusGlyph.image(
                 level: WiFiStatusGlyph.level(for: signalStrength))
         } else if wifiStatus == "Scanning" {
@@ -378,7 +527,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             statusItem.button?.image = WiFiStatusGlyph.image(level: 0)
         } else {
             label = "Wi-Fi Disconnected"
-            connectionPending = false
             statusItem.button?.image = NSImage(
                 systemSymbolName: "wifi.exclamationmark",
                 accessibilityDescription: label)
@@ -387,20 +535,77 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         statusItem.button?.toolTip = label
     }
 
+    private func refreshScanSnapshotIfNeeded(publishedGeneration: UInt32) {
+        guard (!scanSnapshotInitialized || publishedGeneration != scanGeneration),
+              !scanSnapshotLoadPending else { return }
+        scanSnapshotLoadGeneration &+= 1
+        let loadGeneration = scanSnapshotLoadGeneration
+        scanSnapshotLoadPending = true
+        DispatchQueue.global(qos: .userInitiated).async { [client] in
+            let snapshot = client.scanSnapshot()
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      loadGeneration == self.scanSnapshotLoadGeneration else {
+                    return
+                }
+                self.scanSnapshotLoadPending = false
+                guard let snapshot else { return }
+                // A newer snapshot is always safe; an older asynchronous read
+                // must never roll the menu model backwards.
+                guard !self.scanSnapshotInitialized ||
+                      snapshot.generation >= self.scanGeneration else { return }
+                self.networks = buildWirelessNetworks(from: snapshot)
+                self.scanGeneration = snapshot.generation
+                self.scanSnapshotInitialized = true
+                self.rebuildMenu()
+            }
+        }
+    }
+
     private func rebuildMenu() {
         scanMenuItem = nil
         networkMenuItems.removeAll(keepingCapacity: true)
         menu.removeAllItems()
 
+        if driverAvailability != .ready {
+            let status = NSMenuItem(title: statusMessage, action: nil,
+                                    keyEquivalent: "")
+            status.isEnabled = false
+            menu.addItem(status)
+            let detail = NSMenuItem(
+                title: driverAvailability == .kextNotLoaded ?
+                    "Compatible RTL8822CE hardware was detected." :
+                    "A supported Realtek RTL8822CE (10ec:c822) was not found.",
+                action: nil, keyEquivalent: "")
+            detail.isEnabled = false
+            menu.addItem(detail)
+            menu.addItem(.separator())
+            let download = NSMenuItem(title: "Download RealtekRTL8822C…",
+                                      action: #selector(openProjectReleases),
+                                      keyEquivalent: "")
+            download.target = self
+            menu.addItem(download)
+            menu.addItem(.separator())
+            let quit = NSMenuItem(title: "Quit Realtek RTL8822C Wi-Fi",
+                                  action: #selector(quitApplication),
+                                  keyEquivalent: "q")
+            quit.target = self
+            menu.addItem(quit)
+            return
+        }
+
         let toggle = NSMenuItem(title: "Wi-Fi", action: #selector(toggleWiFi),
                                 keyEquivalent: "")
         toggle.target = self
         toggle.state = wifiEnabled ? .on : .off
+        toggle.isEnabled = !interfaceOperationPending
         menu.addItem(toggle)
 
         let statusTitle: String
         if !wifiEnabled {
             statusTitle = "Wi-Fi is off"
+        } else if connectionPending {
+            statusTitle = statusMessage
         } else if !connectedSSID.isEmpty {
             statusTitle = "Connected: \(connectedSSID)"
         } else {
@@ -422,20 +627,49 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 menu.addItem(empty)
             } else {
                 for network in networks {
-                    let suffix = network.isSecure ? "  —  \(network.rssi) dBm" :
-                                                    "  —  Open, \(network.rssi) dBm"
-                    let item = NSMenuItem(title: network.ssid + suffix,
+                    let band = network.channel > 14 ? "5 GHz" : "2.4 GHz"
+                    let security = network.isSecure ? "" : "Open, "
+                    let availability = network.requiresDfs ? ", DFS unavailable" :
+                        (!network.isConnectable ? ", receive only" : "")
+                    let suffix = "  —  \(security)\(band), ch \(network.channel)\(availability), \(network.rssi) dBm"
+                    let title = network.displayName + suffix
+                    let item = NSMenuItem(title: title,
                                           action: #selector(selectNetwork(_:)),
                                           keyEquivalent: "")
                     item.target = self
                     item.representedObject = NetworkBox(network)
-                    item.state = network.ssid == connectedSSID ? .on : .off
+                    item.state = (!network.hidden && !connectedSSID.isEmpty &&
+                                  network.ssid == connectedSSID) ? .on : .off
                     item.image = NSImage(
                         systemSymbolName: network.isSecure ? "lock.fill" : "wifi",
                         accessibilityDescription: network.isSecure ?
                             "Secured network" : "Open network")
                     item.image?.isTemplate = true
-                    item.isEnabled = !scanRunning
+                    item.isEnabled = !connectionPending && !network.hidden &&
+                        network.isConnectable
+                    let permanentlyUnavailable = network.hidden ||
+                        !network.isConnectable
+                    if permanentlyUnavailable {
+                        // AppKit may redraw a disabled menu item with its
+                        // ordinary title color after the menu is reopened.
+                        // Keep receive-only/DFS/hidden rows visibly disabled
+                        // across every menu reconstruction.
+                        item.attributedTitle = NSAttributedString(
+                            string: title,
+                            attributes: [
+                                .foregroundColor: NSColor.disabledControlTextColor
+                            ])
+                    }
+                    if connectionPending && !network.hidden {
+                        item.toolTip = "Cancel the current connection attempt before choosing another network."
+                    }
+                    if network.hidden {
+                        item.toolTip = "Use Join Other Network… and enter this network's SSID."
+                    } else if network.requiresDfs {
+                        item.toolTip = "This network is visible, but DFS connection requires CAC and radar handling that is not implemented yet."
+                    } else if !network.isConnectable {
+                        item.toolTip = "This channel is receive-only under the current regulatory policy."
+                    }
                     networkMenuItems.append(item)
                     menu.addItem(item)
                 }
@@ -446,10 +680,34 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 title: scanRunning ? "Searching…" : "Search for Networks",
                 action: #selector(refreshNetworks), keyEquivalent: "r")
             refresh.target = self
-            refresh.isEnabled = !scanRunning
+            refresh.isEnabled = !scanRunning && !connectionPending
             scanMenuItem = refresh
             menu.addItem(refresh)
-            if !connectedSSID.isEmpty {
+            let joinOther = NSMenuItem(title: "Join Other Network…",
+                                       action: #selector(joinOtherNetwork),
+                                       keyEquivalent: "")
+            joinOther.target = self
+            // An unknown hidden SSID needs its own directed scan. Visible BSS
+            // rows can be queued safely while an ordinary sweep is active.
+            joinOther.isEnabled = !scanRunning && !connectionPending
+            menu.addItem(joinOther)
+            let passwordCandidates = credentialCandidateSSIDs()
+            if !passwordCandidates.isEmpty {
+                let managePassword = NSMenuItem(
+                    title: "Manage WPA2 Password…",
+                    action: #selector(managePassword), keyEquivalent: "")
+                managePassword.target = self
+                managePassword.isEnabled = !connectionPending
+                menu.addItem(managePassword)
+            }
+            if connectionPending {
+                let cancel = NSMenuItem(title: "Cancel Connection",
+                                        action: #selector(cancelConnection),
+                                        keyEquivalent: "")
+                cancel.target = self
+                menu.addItem(cancel)
+            }
+            if !connectedSSID.isEmpty && !connectionPending {
                 let disconnect = NSMenuItem(title: "Disconnect",
                                             action: #selector(disconnect),
                                             keyEquivalent: "")
@@ -459,11 +717,27 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
 
         menu.addItem(.separator())
+        if notificationAuthorizationResolved &&
+           (!notificationAuthorizationGranted || notificationDeliveryError != nil) {
+            let notificationStatus = NSMenuItem(
+                title: notificationDeliveryError == nil ?
+                    "Enable Notifications…" : "Notification Delivery Failed…",
+                action: #selector(openNotificationSettings), keyEquivalent: "")
+            notificationStatus.target = self
+            notificationStatus.toolTip = notificationDeliveryError ??
+                "Enable banners for Realtek RTL8822C Wi-Fi in System Settings."
+            menu.addItem(notificationStatus)
+        }
         let launchAtLogin = NSMenuItem(title: "Launch at Login",
                                        action: #selector(toggleLaunchAtLogin),
                                        keyEquivalent: "")
         launchAtLogin.target = self
-        launchAtLogin.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        if #available(macOS 13.0, *) {
+            launchAtLogin.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        } else {
+            launchAtLogin.isEnabled = false
+            launchAtLogin.toolTip = "Launch at Login requires macOS 13 or newer"
+        }
         menu.addItem(launchAtLogin)
 
 #if RTW_APP_DEBUG
@@ -483,39 +757,99 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func toggleWiFi() {
+        guard !interfaceOperationPending else { return }
         let requested = !wifiEnabled
+        if !requested { localDisconnectRequested = true }
+        interfaceOperationGeneration &+= 1
+        let operationGeneration = interfaceOperationGeneration
+        interfaceOperationPending = true
+        if !requested {
+            // Interface disable cancels an in-flight scan in the driver. Make
+            // its older userspace completion unable to repaint the menu.
+            scanOperationGeneration &+= 1
+            scanRunning = false
+        }
+        rebuildMenu()
         performAsync { [client] in
             client.send(.setInterfaceEnabled, enabled: requested)
         } completion: { [weak self] result in
             guard let self else { return }
+            guard operationGeneration == self.interfaceOperationGeneration else {
+                return
+            }
+            self.interfaceOperationPending = false
             if result != ioSuccess {
                 self.showError(title: "Unable to change Wi-Fi state",
                                result: result)
             }
             self.refreshStatus()
+            self.rebuildMenu()
         }
     }
 
     @objc private func refreshNetworks() { startScan() }
 
+    @objc private func joinOtherNetwork() {
+        let alert = NSAlert()
+        alert.messageText = "Join Other Network"
+        alert.informativeText = "Enter the SSID exactly as configured. Leave the password empty for an open network."
+        alert.addButton(withTitle: "Join")
+        alert.addButton(withTitle: "Cancel")
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 92))
+        let ssidLabel = NSTextField(labelWithString: "Network name (SSID)")
+        ssidLabel.frame = NSRect(x: 0, y: 68, width: 340, height: 18)
+        let ssidField = NSTextField(frame: NSRect(x: 0, y: 42, width: 340, height: 24))
+        ssidField.placeholderString = "Network name (SSID)"
+        let passwordLabel = NSTextField(labelWithString: "WPA2 password (optional)")
+        passwordLabel.frame = NSRect(x: 0, y: 22, width: 340, height: 18)
+        let passwordField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        passwordField.placeholderString = "WPA2 password (optional)"
+        container.addSubview(ssidLabel)
+        container.addSubview(ssidField)
+        container.addSubview(passwordLabel)
+        container.addSubview(passwordField)
+        alert.accessoryView = container
+        alert.window.initialFirstResponder = ssidField
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let ssid = ssidField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !ssid.isEmpty, ssid.utf8.count <= 32 else {
+            showError(title: "Invalid network name",
+                      message: "The SSID must contain 1–32 UTF-8 bytes.")
+            return
+        }
+        let password = passwordField.stringValue
+        if !password.isEmpty && (password.utf8.count < 8 || password.utf8.count > 63) {
+            showError(title: "Invalid password",
+                      message: "A WPA2 password must contain 8–63 UTF-8 bytes.")
+            return
+        }
+        let network = WirelessNetwork(ssid: ssid,
+                                      securityName: password.isEmpty ? "Open" : "WPA2",
+                                      channel: 0, centerChannel: 0, bandwidth: 20,
+                                      rssi: -127, bssid: "", hidden: true,
+                                      ageMs: 0, flags: 0)
+        var needsSave = false
+        if !password.isEmpty {
+            sessionCredentials[ssid] = (password, true)
+            needsSave = true
+        }
+        connect(to: network, password: password, needsSave: needsSave)
+    }
+
     private func startScan() {
-        guard wifiEnabled, !scanRunning else { return }
+        guard wifiEnabled, !scanRunning, !connectionPending else { return }
+        scanOperationGeneration &+= 1
+        let operationGeneration = scanOperationGeneration
         scanRunning = true
         lastScanAttemptAt = Date()
         scanMenuItem?.title = "Searching…"
         scanMenuItem?.isEnabled = false
-        for item in networkMenuItems { item.isEnabled = false }
         performAsync { [client] in
-            let connected = !(client.property("ConnectedSSID") ?? "").isEmpty
             let result = client.send(.scan)
             guard result == ioSuccess else { return result }
-            // Disconnected scans complete synchronously and do not update the
-            // connected-scan state property, which may still contain an old
-            // terminal result from an earlier association.
-            if !connected { return ioSuccess }
             var observedActiveScan = false
             for _ in 0..<80 {
-                let state = client.property("ConnectedScanState") ?? ""
+                let state = client.property("ScanState") ?? ""
                 if state.contains("active=1") {
                     observedActiveScan = true
                     Thread.sleep(forTimeInterval: 0.2)
@@ -530,6 +864,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             return ioTimeout
         } completion: { [weak self] result in
             guard let self else { return }
+            guard operationGeneration == self.scanOperationGeneration else {
+                return
+            }
             self.scanRunning = false
             if result == ioSuccess {
                 self.lastScanCompletedAt = Date()
@@ -545,6 +882,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     @objc private func selectNetwork(_ sender: NSMenuItem) {
+        guard !connectionPending else { return }
         guard let box = sender.representedObject as? NetworkBox else { return }
         let network = box.network
         if network.ssid == connectedSSID { return }
@@ -569,20 +907,126 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         connect(to: network, password: password, needsSave: needsSave)
     }
 
+    private func credentialCandidateSSIDs() -> [String] {
+        var candidates = Set(networks.compactMap { network in
+            network.isSecure && !network.hidden && !network.ssid.isEmpty ?
+                network.ssid : nil
+        })
+        candidates.formUnion(sessionCredentials.keys)
+        return candidates.sorted {
+            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+        }
+    }
+
+    @objc private func managePassword() {
+        guard !connectionPending else { return }
+        let candidates = credentialCandidateSSIDs()
+        guard !candidates.isEmpty else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Manage WPA2 Password"
+        alert.informativeText = "Choose a network. A replacement password is saved only after a successful WPA2 connection."
+        alert.addButton(withTitle: "Enter New Password")
+        alert.addButton(withTitle: "Forget Password")
+        alert.addButton(withTitle: "Cancel")
+        let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0,
+                                                 width: 320, height: 26),
+                                   pullsDown: false)
+        picker.addItems(withTitles: candidates)
+        if let connectedIndex = candidates.firstIndex(of: connectedSSID) {
+            picker.selectItem(at: connectedIndex)
+        }
+        alert.accessoryView = picker
+
+        let response = alert.runModal()
+        guard response != .alertThirdButtonReturn,
+              let ssid = picker.selectedItem?.title else { return }
+        if response == .alertSecondButtonReturn {
+            KeychainStore.removePassword(for: ssid)
+            sessionCredentials.removeValue(forKey: ssid)
+            statusMessage = "Forgot the saved password for \(ssid)"
+            rebuildMenu()
+            return
+        }
+
+        guard let replacement = requestPassword(for: ssid) else { return }
+        guard replacement.utf8.count >= 8 && replacement.utf8.count <= 63 else {
+            showError(title: "Invalid password",
+                      message: "A WPA2 password must contain 8–63 UTF-8 bytes.")
+            return
+        }
+        sessionCredentials[ssid] = (replacement, true)
+        statusMessage = "The new password for \(ssid) will be saved after a successful connection"
+
+        // Test the replacement immediately when another visible BSS is
+        // selected. For the currently connected SSID, keep the new value only
+        // in memory until the next real reconnect; an idempotent Connect would
+        // not validate it and therefore must not persist it.
+        if connectedSSID != ssid,
+           let network = networks.filter({
+               !$0.hidden && $0.isSecure && $0.isConnectable && $0.ssid == ssid
+           }).max(by: { $0.rssi < $1.rssi }) {
+            connect(to: network, password: replacement, needsSave: true)
+        } else {
+            rebuildMenu()
+        }
+    }
+
     private func connect(to network: WirelessNetwork, password: String,
                          needsSave: Bool) {
+        guard !connectionPending else { return }
+        connectionOperationGeneration &+= 1
+        let operationGeneration = connectionOperationGeneration
+        localConnectionCancellationRequested = false
         connectionPending = true
         statusMessage = "Connecting to \(network.ssid)…"
         statusItem.button?.image = WiFiStatusGlyph.image(level: 0)
         statusItem.button?.toolTip = statusMessage
         rebuildMenu()
+        let previousAttemptID = client.property("ConnectionAttemptID")
         performAsync { [client] in
-            let result = client.send(.connect, ssid: network.ssid,
+            var result = client.send(.connect, ssid: network.ssid,
                                      password: password)
+            if result == ioNotReady {
+                result = client.send(.directedScan, ssid: network.ssid)
+                guard result == ioSuccess else { return result }
+                var observedActiveScan = false
+                var scanCompleted = false
+                for _ in 0..<100 {
+                    let state = client.property("ScanState") ?? ""
+                    if state.contains("active=1") {
+                        observedActiveScan = true
+                        Thread.sleep(forTimeInterval: 0.1)
+                        continue
+                    }
+                    if state.contains("result=cancelled") { return ioAborted }
+                    if state.contains("result=complete") &&
+                        (observedActiveScan || state.contains("directed=1")) {
+                        scanCompleted = true
+                        break
+                    }
+                    Thread.sleep(forTimeInterval: 0.1)
+                }
+                guard scanCompleted else { return ioTimeout }
+                result = client.send(.connect, ssid: network.ssid,
+                                     password: password)
+            }
             guard result == ioSuccess else { return result }
+            let attemptID = client.property("ConnectionAttemptID")
             for _ in 0..<120 {
+                let currentAttemptID = client.property("ConnectionAttemptID")
+                if attemptID != nil && currentAttemptID == attemptID {
+                    let structuredResult = client.property("ConnectionResult") ?? ""
+                    if structuredResult == "success" { return ioSuccess }
+                    if structuredResult == "cancelled" { return ioAborted }
+                    if structuredResult == "failure" { return ioError }
+                }
                 let state = client.property("WiFiStatus") ?? ""
-                if state == "Connected" { return ioSuccess }
+                let activeSsid = client.property("ConnectedSSID") ?? ""
+                if state == "Connected" && activeSsid == network.ssid {
+                    return ioSuccess
+                }
+                if state == "Cancelled" { return ioAborted }
                 if state == "Failed" || state.contains("Password") ||
                     state.contains("Unsupported") { return ioError }
                 Thread.sleep(forTimeInterval: 0.25)
@@ -590,33 +1034,106 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             return ioTimeout
         } completion: { [weak self] result in
             guard let self else { return }
+            guard operationGeneration == self.connectionOperationGeneration else {
+                return
+            }
             self.connectionPending = false
             self.refreshStatus()
+            if self.localConnectionCancellationRequested || result == ioAborted {
+                self.localConnectionCancellationRequested = false
+                self.statusMessage = "Connection cancelled"
+                self.rebuildMenu()
+                return
+            }
             if result == ioSuccess && self.connectedSSID == network.ssid {
                 if network.isSecure && needsSave {
                     KeychainStore.save(password: password, for: network.ssid)
                     self.sessionCredentials[network.ssid] = (password, false)
                 }
             } else {
-                let detail = self.client.property("DriverStatus") ??
-                             ioReturnDescription(result)
-                let wifiState = self.client.property("WiFiStatus") ?? ""
-                let failure = (detail + " " + wifiState).lowercased()
-                let credentialFailure = failure.contains("password") ||
-                    failure.contains("four-way") || failure.contains("mic") ||
-                    failure.contains("handshake rejected")
-                if network.isSecure && credentialFailure {
-                    KeychainStore.removePassword(for: network.ssid)
-                    self.sessionCredentials.removeValue(forKey: network.ssid)
+                let failureCode = self.client.property(
+                    "ConnectionFailureCode") ?? "unknown"
+                let detail = self.connectionFailureDescription(
+                    failureCode,
+                    fallback: self.client.property("DriverStatus") ??
+                              ioReturnDescription(result))
+                let failedAttemptID = self.client.property("ConnectionAttemptID")
+                let credentialFailure = failedAttemptID != previousAttemptID &&
+                    failureCode == "invalid-credentials"
+                let passwordRetrySuggested = credentialFailure ||
+                    (failedAttemptID != previousAttemptID &&
+                     failureCode == "wpa-timeout")
+                if network.isSecure && passwordRetrySuggested {
+                    if credentialFailure {
+                        KeychainStore.removePassword(for: network.ssid)
+                        self.sessionCredentials.removeValue(forKey: network.ssid)
+                    }
+                    if let replacement = self.requestPassword(for: network.ssid) {
+                        self.sessionCredentials[network.ssid] = (replacement, true)
+                        self.connect(to: network, password: replacement,
+                                     needsSave: true)
+                        return
+                    }
                 }
-                self.showError(title: "Could not connect to \(network.ssid)",
-                               message: detail)
+                self.statusMessage = "Could not connect to \(network.ssid): \(detail)"
+                self.postNotification(
+                    key: "connect-failed:\(network.ssid):\(detail)",
+                    title: "Wi-Fi connection failed", body: detail)
             }
             self.rebuildMenu()
         }
     }
 
+    private func connectionPhaseDescription(_ phase: String) -> String {
+        switch phase {
+        case "queued": return "Waiting for the network scan to finish…"
+        case "preparing": return "Preparing the Wi-Fi connection…"
+        case "authenticating": return "Authenticating with the network…"
+        case "associating": return "Joining the network…"
+        case "negotiating-wpa": return "Securing the WPA2 connection…"
+        default: return "Connecting…"
+        }
+    }
+
+    private func connectionFailureDescription(_ code: String,
+                                              fallback: String) -> String {
+        switch code {
+        case "invalid-credentials": return "The WPA2 password was rejected."
+        case "auth-timeout": return "The access point did not answer authentication."
+        case "assoc-timeout": return "The access point did not complete association."
+        case "wpa-timeout": return "The WPA2 handshake timed out."
+        case "unsupported-security": return "This network uses an unsupported security mode."
+        case "channel-blocked": return "Transmission on this channel is not authorized by the current regulatory policy."
+        case "dfs-unavailable": return "This DFS channel requires CAC and radar handling that is not implemented yet."
+        case "channel-program-failed": return "The wireless channel could not be configured."
+        case "tx-power-invalid": return "The validated transmit-power profile is unavailable."
+        case "ap-disconnected": return "The access point ended the connection attempt."
+        case "bandwidth-mismatch": return "The access point changed the negotiated channel width."
+        case "firmware-link-failed": return "Firmware link setup failed."
+        case "key-install-failed": return "WPA2 key installation failed."
+        case "cancelled", "replaced": return "The connection attempt was cancelled."
+        default: return fallback
+        }
+    }
+
+    @objc private func cancelConnection() {
+        guard connectionPending else { return }
+        localConnectionCancellationRequested = true
+        statusMessage = "Cancelling connection…"
+        rebuildMenu()
+        performAsync { [client] in client.send(.cancelConnection) } completion: {
+            [weak self] result in
+            guard let self else { return }
+            if result != ioSuccess {
+                self.localConnectionCancellationRequested = false
+                self.showError(title: "Unable to cancel connection", result: result)
+            }
+            self.refreshStatus()
+        }
+    }
+
     @objc private func disconnect() {
+        localDisconnectRequested = true
         performAsync { [client] in client.send(.disconnect) } completion: {
             [weak self] result in
             guard let self else { return }
@@ -649,11 +1166,130 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         debugWindow?.window?.makeKeyAndOrderFront(nil)
         NSApplication.shared.activate(ignoringOtherApps: true)
     }
+
 #endif
 
     @objc private func quitApplication() { NSApplication.shared.terminate(nil) }
 
+    @objc private func openProjectReleases() {
+        NSWorkspace.shared.open(projectReleasesURL)
+    }
+
+    private func handleLinkTransition(wifiStatus: String, ssid: String) {
+        guard linkStateInitialized else {
+            linkStateInitialized = true
+            previousWiFiStatus = wifiStatus
+            previousConnectedSSID = ssid
+            return
+        }
+        let wasConnected = previousWiFiStatus == "Connected" &&
+                           !previousConnectedSSID.isEmpty
+        let isConnected = wifiStatus == "Connected" && !ssid.isEmpty
+        if isConnected && (!wasConnected || previousConnectedSSID != ssid) {
+            postNotification(key: "connected:\(ssid)", title: "Wi-Fi connected",
+                             body: "Connected to \(ssid).")
+        } else if wasConnected && !isConnected {
+            if !localDisconnectRequested {
+                postNotification(key: "disconnected:\(previousConnectedSSID)",
+                                 title: "Wi-Fi disconnected",
+                                 body: "The connection to \(previousConnectedSSID) was lost.")
+            }
+            localDisconnectRequested = false
+        }
+        previousWiFiStatus = wifiStatus
+        previousConnectedSSID = ssid
+    }
+
+    private func handleLinkEvent(generation: UInt32, type: String,
+                                 ssid: String, reason: String) {
+        guard let previousGeneration = lastLinkEventGeneration else {
+            lastLinkEventGeneration = generation
+            previousWiFiStatus = type == "connected" ? "Connected" : "Idle"
+            previousConnectedSSID = type == "connected" ? ssid : ""
+            return
+        }
+        guard generation != previousGeneration else { return }
+        lastLinkEventGeneration = generation
+
+        switch type {
+        case "connected":
+            localDisconnectRequested = false
+            postNotification(key: "link:\(generation):connected",
+                             title: "Wi-Fi connected",
+                             body: "Connected to \(ssid).")
+            previousWiFiStatus = "Connected"
+            previousConnectedSSID = ssid
+        case "disconnected":
+            postNotification(key: "link:\(generation):disconnected",
+                             title: "Wi-Fi disconnected",
+                             body: ssid.isEmpty ?
+                                "The Wi-Fi connection was lost." :
+                                "The connection to \(ssid) was lost.")
+            previousWiFiStatus = "Idle"
+            previousConnectedSSID = ""
+            localDisconnectRequested = false
+        case "local-disconnect":
+            previousWiFiStatus = "Idle"
+            previousConnectedSSID = ""
+            localDisconnectRequested = false
+        default:
+            _ = reason
+        }
+    }
+
+    private func postNotification(key: String, title: String, body: String) {
+        guard key != lastNotificationKey,
+              !notificationKeysInFlight.contains(key) else { return }
+        guard notificationAuthorizationResolved else {
+            pendingNotification = (key, title, body)
+            return
+        }
+        guard notificationAuthorizationGranted else { return }
+        notificationKeysInFlight.insert(key)
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        let request = UNNotificationRequest(
+            identifier: "org.realtekrtl8822c.\(UUID().uuidString)",
+            content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request) { [weak self] error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.notificationKeysInFlight.remove(key)
+                if error == nil {
+                    self.lastNotificationKey = key
+                    self.notificationDeliveryError = nil
+                } else {
+                    self.notificationDeliveryError = error?.localizedDescription
+                    self.rebuildMenu()
+                }
+            }
+        }
+    }
+
+    @objc private func openNotificationSettings() {
+        let address: String
+        if #available(macOS 13.0, *) {
+            address = "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
+        } else {
+            address = "x-apple.systempreferences:com.apple.preference.notifications"
+        }
+        if let url = URL(string: address) { NSWorkspace.shared.open(url) }
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler:
+            @escaping (UNNotificationPresentationOptions) -> Void) {
+        _ = center
+        _ = notification
+        completionHandler([.banner, .sound])
+    }
+
     @objc private func toggleLaunchAtLogin() {
+        guard #available(macOS 13.0, *) else { return }
         do {
             if SMAppService.mainApp.status == .enabled {
                 try SMAppService.mainApp.unregister()

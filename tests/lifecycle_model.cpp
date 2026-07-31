@@ -1,4 +1,5 @@
 #include <cassert>
+#include <cstring>
 
 struct Lifecycle {
     bool suspended = false;
@@ -122,6 +123,28 @@ struct PartialStart {
     }
 };
 
+struct LinkEvents {
+    unsigned generation = 0;
+    const char* type = "none";
+
+    void publish(const char* nextType) {
+        generation++;
+        if (generation == 0) generation = 1;
+        type = nextType;
+    }
+
+    void disconnect(const char* reason, bool authorized) {
+        if (!authorized) return;
+        bool local = reason &&
+            (std::strcmp(reason, "user") == 0 ||
+             std::strcmp(reason, "reconnect") == 0 ||
+             std::strcmp(reason, "interface-disabled") == 0 ||
+             std::strcmp(reason, "system-sleep") == 0 ||
+             std::strcmp(reason, "connection-cancelled") == 0);
+        publish(local ? "local-disconnect" : "disconnected");
+    }
+};
+
 int main() {
     Lifecycle interfaceCycle;
     interfaceCycle.disableInterface();
@@ -202,5 +225,18 @@ int main() {
         assert(start.releasedMappings == start.preparedMappings);
         assert(!start.releasedWhileBusMastering);
     }
+
+    LinkEvents events;
+    events.publish("connected");
+    assert(events.generation == 1 && std::strcmp(events.type, "connected") == 0);
+    events.disconnect("user", true);
+    assert(events.generation == 2 &&
+           std::strcmp(events.type, "local-disconnect") == 0);
+    events.publish("connected");
+    events.disconnect("peer-deauth", true);
+    assert(events.generation == 4 &&
+           std::strcmp(events.type, "disconnected") == 0);
+    events.disconnect("timeout", false);
+    assert(events.generation == 4);
     return 0;
 }

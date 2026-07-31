@@ -9,7 +9,9 @@ DerivedData/
 MacKernelSDK/
 LegacyBackup/
 backups/
+# Private development memory and release plans.
 docs/internal/
+docs/internal/V0.0.3_SCAN_CONNECTION_PLAN.md
 firmware/rtw8822c_fw.h
 AGENTS.md
 .idea/

@@ -1,7 +1,7 @@
 # RealtekRTL8822C
 
 RealtekRTL8822C is an x86_64 macOS PCIe driver for the Realtek RTL8822CE
-(`10ec:c822`). Version `0.0.2` is the current release.
+(`10ec:c822`). Version `0.0.3` is the current release.
 
 The driver is implemented as an `IOEthernetController` with a native menu bar
 application, `RealtekRTL8822CMenu`, and the companion command-line utility
@@ -19,7 +19,8 @@ machine.
 
 Hardware-confirmed functionality includes:
 
-- scanning on 2.4 GHz channels 1-11 and guarded non-DFS 5 GHz channels;
+- structured active/passive scanning across 2.4 GHz and 5 GHz, with unsupported
+  transmit channels shown explicitly as receive-only;
 - open and WPA2-Personal/CCMP association;
 - DHCP, DNS, and sustained bidirectional IP traffic;
 - HT and VHT operation, WMM, TX/RX Block Ack, aggregation, and RX reorder;
@@ -27,12 +28,14 @@ Hardware-confirmed functionality includes:
 - disconnect, reconnect, AP switching, interface down/up, and sleep/wake
   recovery;
 - connected off-channel scanning with restoration of the active link;
+- hidden-network directed discovery, queued/cancellable connection attempts,
+  credential recovery, and native link notifications;
 - separate diagnostic Debug and log-free Release profiles.
 
 The final Release profile has been tested on the reference system through
-normal traffic, sustained load, reconnect, and sleep/wake without a known
+normal traffic, sustained load, reconnect, and sleep/wake without finding a
 driver failure. Sustained bidirectional traffic remained stable in the final
-v0.0.2 run. This remains a single-system matrix, not a claim of compatibility
+v0.0.3 run. This remains a single-system matrix, not a claim of compatibility
 with every RTL8822CE laptop or firmware configuration.
 
 ## Channel policy and limitations
@@ -51,13 +54,8 @@ The following are not supported:
 - automatic installation or modification of an OpenCore configuration.
 
 HT40/VHT40 selection is implemented, but the published reference matrix is
-centered on hardware-confirmed 20 MHz and VHT80 links. Connected scanning was
-validated on VHT80; additional AP, bandwidth, and 2.4 GHz connected-scan
-coverage is welcome as post-release compatibility evidence.
-
-Known issue: on the reference system, the built-in touchpad can briefly lag
-during network scanning or connection. This issue is known and remains open in
-the current driver.
+centered on hardware-confirmed 20 MHz and VHT80 links. Additional boards, APs,
+macOS versions, and bandwidth combinations remain useful compatibility data.
 
 ## Build
 
@@ -88,6 +86,12 @@ logging, and adds a **Debug Info** window to the menu app. Release compiles out
 those properties, logging, diagnostic report keys, and the Debug UI. Automated
 binary checks enforce this boundary.
 
+The application and CLI use a macOS 12 deployment target. The Debug kext also
+uses an experimental macOS 12 deployment target for compatibility testing, but
+it has only been run on the current macOS 15 reference system and is built with
+newer SDK kmod startup objects. It is not evidence of macOS 12-14 support. The
+Release kext retains the hardware-confirmed macOS 15.5 target.
+
 Deployment is deliberately outside the build system. Copy the selected kext
 and utility manually to the locations used by your boot configuration. Keep a
 known-bootable EFI backup before replacing a kernel extension.
@@ -107,14 +111,14 @@ under `build/package/`.
 `make package` creates the complete maintainer archive, two kext-only GitHub
 Release assets, and the menu application asset:
 
-- `build/package/RealtekRTL8822C-0.0.2-Release.zip`;
-- `build/package/RealtekRTL8822C-0.0.2-Debug.zip`;
-- `build/package/RealtekRTL8822CMenu-0.0.2.zip`.
+- `build/package/RealtekRTL8822C-0.0.3-Release.zip`;
+- `build/package/RealtekRTL8822C-0.0.3-Debug.zip`;
+- `build/package/RealtekRTL8822CMenu-0.0.3.zip`.
 
 Each of those two archives contains only `RealtekRTL8822C.kext`. The Release
 asset is intended for ordinary use; Debug is intended for diagnostic reports.
 The application archive contains only `RealtekRTL8822CMenu.app` and is a normal
-v0.0.2 release download alongside the two kext archives.
+v0.0.3 release download alongside the two kext archives.
 `make package-local` creates the complete locally named test archive. None of
 these commands installs anything.
 
@@ -123,7 +127,7 @@ these commands installs anything.
 Launch `RealtekRTL8822CMenu.app` for menu bar scanning, connection,
 disconnect, and Wi-Fi on/off control. WPA2 credentials are stored in the user
 Keychain. Driver commands use a narrow local-user `IOUserClient` and do not
-require `sudo` with the v0.0.2 kext.
+require `sudo` with the v0.0.3 kext.
 
 Run `rtl8822cctl help` for the command list. Interactive `connect` prompts for a
 password without echoing it or placing it in shell history. See the
@@ -135,7 +139,7 @@ password without echoing it or placing it in shell history. See the
 
 - [Roadmap](ROADMAP.md)
 - [Changelog](CHANGELOG.md)
-- [v0.0.2 release notes](RELEASE_NOTES.md)
+- [v0.0.3 release notes](RELEASE_NOTES.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)

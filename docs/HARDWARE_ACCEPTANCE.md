@@ -1,10 +1,10 @@
-# v0.0.2 Hardware Acceptance
+# v0.0.3 Hardware Acceptance
 
-The reference RTL8822CE cut D system has completed the v0.0.2 functional run,
+The reference RTL8822CE cut D system has completed the v0.0.3 functional run,
 including the menu application, non-root controls, Release-profile traffic,
-reconnect, interface lifecycle, and sleep/wake testing without a known driver
-failure. This document is the repeatable qualification procedure for future
-builds and additional hardware; it is not a list of unresolved blockers.
+structured scanning, hidden-network discovery, reconnect, interface lifecycle,
+and sleep/wake testing. This document is the repeatable qualification procedure
+for future builds and additional hardware.
 
 Run this procedure on the exact Debug and Release artifacts intended for the
 release. Record artifact hashes, macOS version, OpenCore version, PCI ID, chip
@@ -31,6 +31,7 @@ export RTL8822CCTL="/path/to/rtl8822cctl"
 Debug acceptance:
 
 - version and build configuration match the selected artifact;
+- `DriverBuildTargetMacOS` reports `12.0` for Debug and `15.5` for Release;
 - power and interface state are active;
 - firmware, EFUSE, DMA, PHY, DACK, IQK, and TXGAPK complete without failure;
 - TXDMA and TX error status are zero;
@@ -38,6 +39,12 @@ Debug acceptance:
 
 Complete at least ten cold boots. Every boot must scan and connect without a
 firmware, calibration, DMA, or interface failure.
+
+The Debug macOS 12 deployment target is an experimental compatibility-testing
+option only. It has been run on the macOS 15 reference machine, but not on
+macOS 12-14, and the current SDK supplies newer kmod startup objects. Do not
+record an older macOS version as supported until it completes this entire
+procedure independently.
 
 ## 2. Scan and channel coverage
 
@@ -47,8 +54,15 @@ Verify discovery and non-zero RSSI on:
 - one lower-band 5 GHz access point on channels 36-48;
 - one upper-band 5 GHz access point on channels 149-165 where locally legal.
 
+Use `rtl8822cctl bss` to verify that same-name BSSes remain distinct by BSSID,
+hidden entries retain their channel and age, and later Probe Responses can
+upgrade a hidden entry without a subsequent beacon erasing its SSID. Confirm
+that the scan plan reaches channels 12/13 and 52-144 passively. DFS and other
+receive-only rows must remain visible but unavailable for connection.
+
 Validate 20 MHz, 40 MHz, and 80 MHz operation on controlled access points.
-Channel 165 must remain 20 MHz. Do not test or enable DFS transmission.
+Channel 165 must remain 20 MHz. Do not test or enable DFS transmission; that
+requires the regulatory, CAC, radar, and evacuation work planned for v0.0.4.
 
 Reject any result where the selected primary channel, center channel,
 bandwidth, RF state, or transmit-power table does not match the access point.
@@ -66,10 +80,20 @@ Test a router and an Android hotspot using `RealtekRTL8822CMenu.app`:
 6. Disconnect and confirm the link becomes idle.
 7. Reconnect without rebooting.
 8. Switch directly to the other access point and repeat.
-9. Enter a wrong password, then immediately connect with the correct password.
+9. Enter a wrong password and verify that a cancellable replacement prompt
+   appears without saving the failed credential.
+10. Retry with the correct password and confirm that it is saved only after the
+    successful WPA2 handshake.
+11. Replace and forget the password through **Manage WPA2 Password...**.
+12. Start a connection during a scan, confirm it queues, then repeat and cancel
+    it during discovery, authentication, association, and WPA negotiation.
+13. Use **Join Other Network...** to discover and connect to a controlled hidden
+    SSID on a supported transmit channel.
+14. Confirm bounded notifications for connection, disconnection, and actionable
+    failure, including a queued connection.
 
 Repeat the connection through `rtl8822cctl connect` as a CLI fallback. Neither
-the application nor v0.0.2 CLI commands should require `sudo`.
+the application nor v0.0.3 CLI commands should require `sudo`.
 
 Reject stale credentials, stale CAM entries, replay failures, permanent queue
 stalls, TXDMA faults, or an inability to reconnect.
@@ -156,7 +180,9 @@ With the Release kext, CLI, and menu application installed:
 - scan, connect, traffic, connected scan, disconnect, reconnect, and sleep/wake
   work exactly as in the Debug functional run;
 - the application contains no **Debug Info** item and continues to handle
-  automatic/manual scans, Keychain credentials, Wi-Fi on/off, and errors.
+  automatic/manual scans, structured BSS results, queued/cancelled connections,
+  hidden-network discovery, notifications, Keychain credentials, Wi-Fi on/off,
+  and errors.
 
 ## 8. Shutdown and final evidence
 

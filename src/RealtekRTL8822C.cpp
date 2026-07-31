@@ -148,6 +148,41 @@ static const IOOptionBits kRtwDmaPayloadMemoryOptions =
     kIODirectionInOut | kIOMapCopybackCache |
     kIOMemoryPhysicallyContiguous;
 static const UInt64 kRtwRecentScanMaxAgeNs = 10000000000ULL;
+
+struct RtwScanChannel {
+    UInt8 channel;
+    bool active;
+};
+
+// Active probing is limited to the already supported non-DFS TX set. Channels
+// 12/13 and DFS channels are still useful receive-only scan targets, but this
+// driver has no regulatory-domain or DFS/CAC implementation that would make
+// transmitting on them safe.
+static const RtwScanChannel kRtwScanChannels[] = {
+    { 1, true }, { 2, true }, { 3, true }, { 4, true }, { 5, true },
+    { 6, true }, { 7, true }, { 8, true }, { 9, true }, { 10, true },
+    { 11, true }, { 12, false }, { 13, false },
+    { 36, true }, { 40, true }, { 44, true }, { 48, true },
+    { 52, false }, { 56, false }, { 60, false }, { 64, false },
+    { 100, false }, { 104, false }, { 108, false }, { 112, false },
+    { 116, false }, { 120, false }, { 124, false }, { 128, false },
+    { 132, false }, { 136, false }, { 140, false }, { 144, false },
+    { 149, true }, { 153, true }, { 157, true }, { 161, true },
+    { 165, true }
+};
+static const UInt32 kRtwScanChannelCount =
+    sizeof(kRtwScanChannels) / sizeof(kRtwScanChannels[0]);
+
+static bool rtwChannelCanTransmit(int channel) {
+    if (channel >= 1 && channel <= 11) return true;
+    return channel == 36 || channel == 40 || channel == 44 || channel == 48 ||
+           channel == 149 || channel == 153 || channel == 157 ||
+           channel == 161 || channel == 165;
+}
+
+static bool rtwChannelRequiresDfs(int channel) {
+    return channel >= 52 && channel <= 144;
+}
 struct apple80211_channel {
     UInt32 version;
     UInt32 channel;
@@ -172,6 +207,8 @@ private:
 
     static IOReturn commandAction(OSObject* target, void* reference,
                                   IOExternalMethodArguments* arguments);
+    static IOReturn scanSnapshotAction(OSObject* target, void* reference,
+                                       IOExternalMethodArguments* arguments);
 
 public:
     bool start(IOService* provider) override;
@@ -324,11 +361,16 @@ private:
     IOReturn setInterfaceEnabledGated(bool enabled);
     IOReturn setUserInterfaceEnabledGated(bool enabled);
     IOReturn executeUserClientCommand(const RTL8822CUserClientCommand& command);
+    IOReturn copyUserClientScanSnapshot(RTL8822CUserClientScanSnapshot* snapshot);
+    static IOReturn copyUserClientScanSnapshotAction(void* target, void* snapshot,
+                                                      void*, void*, void*);
     void reconcileInterfaceStateFromBsd();
     void activateNetworkDataPath(const char* reason);
 
     struct RTL8822CScanResult {
         char ssid[33];
+        UInt8 ssidLength;
+        bool hidden;
         UInt8 bssid[6];
         int channel;
         int rssi;
@@ -359,6 +401,7 @@ private:
 
     RTL8822CScanResult customScanResults[32];
     int customScanResultsCount;
+    UInt32 scanResultsGeneration;
     uint64_t lastScanCompletedTime;
     int isrCallsCount;
     int debugAuthRxCount;
@@ -496,6 +539,10 @@ private:
     UInt32 wpaMicFailures;
     UInt32 wpaReplayDrops;
     UInt32 wpaDecryptFailures;
+    UInt32 staleAttemptDrops;
+    UInt32 authPhaseAttemptId;
+    UInt32 assocPhaseAttemptId;
+    UInt32 wpaPhaseAttemptId;
     uint64_t wpaStateStartTime;
     bool channelCalibrationValid;
     int calibratedChannel;
@@ -510,6 +557,10 @@ private:
     };
 
     RTL8822CConnState connState;
+    UInt32 linkEventGeneration;
+    UInt32 connectionAttemptGeneration;
+    bool connectionAttemptActive;
+    bool runningPendingConnect;
     char targetSsid[33];
     UInt8 targetBssid[6];
     int targetChannel;
@@ -537,6 +588,11 @@ private:
     void traceEvent(const char* event);
     void publishDebugSnapshot();
     void publishConnectedScanState(const char* state);
+    void publishLinkEvent(const char* type, const char* ssid,
+                          const char* reason);
+    void beginConnectionAttempt(const char* ssid, const char* phase);
+    void publishConnectionAttempt(const char* phase, const char* result,
+                                  const char* failureCode);
     const char* connectionStateName() const;
     void connectionWatchdog(OSObject* owner, IOTimerEventSource* sender);
     void runConnectionWatchdog();
@@ -548,15 +604,16 @@ private:
     void rxPacketPoolTimerFired(OSObject* owner, IOTimerEventSource* sender);
 
     bool transmitWifiFrame(const UInt8* frame, UInt32 len, UInt8 qsel);
-    bool performWifiScan();
+    bool sendProbeRequest(const char* ssid = nullptr);
     bool startConnectedScan();
     void connectedScanTimerFired(OSObject* owner, IOTimerEventSource* sender);
     void advanceConnectedScan(IOTimerEventSource* sender);
     void finishConnectedScan(bool cancelled, const char* reason, bool restoreHome);
     bool restoreConnectedScanHome();
+    void clearPendingConnect();
+    IOReturn runPendingConnect();
     void publishScanResults();
     void pruneScanResults(uint64_t maxAgeNs);
-    void processRxPacketsForScan();
     void parseBeaconOrProbeResponse(const UInt8* frame, UInt32 len, int signalDbm);
     int extractRxSignalDbm(const UInt8* phyStatus, UInt32 phyStatusLen);
     void handleMgmtFrame(const UInt8* frame, UInt32 len);
@@ -804,6 +861,7 @@ private:
     UInt8 debugRxLastRate;
     UInt8 debugRxLastBw;
     UInt32 connectedScanIndex;
+    UInt32 connectedScanEndIndex;
     UInt32 connectedScanOriginalRcr;
     UInt32 connectedScanHomePrimary;
     UInt32 connectedScanHomeCenter;
@@ -811,6 +869,15 @@ private:
     UInt8 connectedScanHomePrimaryIndex;
     UInt8 connectedScanPhase;
     UInt8 connectedScanDrainRetries;
+    bool scanHasHome;
+    UInt32 scanProbeRequests;
+    UInt32 scanProbeFailures;
+    UInt32 scanPassiveDwells;
+    char scanDirectedSsid[33];
+    UInt8 scanDirectedChannel;
+    bool pendingConnectValid;
+    char pendingConnectSsid[33];
+    char pendingConnectPassword[65];
 
     // Channel switching
     bool setChannelHw(UInt32 channel, UInt32 flags, UInt8 bandwidth = 0,
@@ -907,13 +974,28 @@ IOReturn RealtekRTL8822CUserClient::commandAction(
     return client->owner->executeUserClientCommand(*command);
 }
 
+IOReturn RealtekRTL8822CUserClient::scanSnapshotAction(
+    OSObject* target, void*, IOExternalMethodArguments* arguments) {
+    RealtekRTL8822CUserClient* client =
+        OSDynamicCast(RealtekRTL8822CUserClient, target);
+    if (!client || !client->owner || !arguments ||
+        !arguments->structureOutput ||
+        arguments->structureOutputSize != sizeof(RTL8822CUserClientScanSnapshot)) {
+        return kIOReturnBadArgument;
+    }
+    return client->owner->copyUserClientScanSnapshot(
+        static_cast<RTL8822CUserClientScanSnapshot*>(arguments->structureOutput));
+}
+
 IOReturn RealtekRTL8822CUserClient::externalMethod(
     uint32_t selector, IOExternalMethodArguments* arguments,
     IOExternalMethodDispatch* dispatch, OSObject* target, void* reference) {
     (void)dispatch;
     static const IOExternalMethodDispatch methods[kRTL8822CUserClientSelectorCount] = {
         { &RealtekRTL8822CUserClient::commandAction, 0,
-          sizeof(RTL8822CUserClientCommand), 0, 0 }
+          sizeof(RTL8822CUserClientCommand), 0, 0 },
+        { &RealtekRTL8822CUserClient::scanSnapshotAction, 0, 0, 0,
+          sizeof(RTL8822CUserClientScanSnapshot) }
     };
 
     if (selector >= kRTL8822CUserClientSelectorCount) {
@@ -923,6 +1005,68 @@ IOReturn RealtekRTL8822CUserClient::externalMethod(
         selector, arguments,
         const_cast<IOExternalMethodDispatch*>(&methods[selector]),
         target ? target : this, reference);
+}
+
+IOReturn RealtekRTL8822C::copyUserClientScanSnapshotAction(
+    void* target, void* snapshot, void*, void*, void*) {
+    RealtekRTL8822C* controller = static_cast<RealtekRTL8822C*>(target);
+    RTL8822CUserClientScanSnapshot* output =
+        static_cast<RTL8822CUserClientScanSnapshot*>(snapshot);
+    if (!controller || !output) return kIOReturnBadArgument;
+
+    memset(output, 0, sizeof(*output));
+    output->version = RTL8822C_USER_CLIENT_PROTOCOL_VERSION;
+    output->generation = controller->scanResultsGeneration;
+    output->count = controller->customScanResultsCount < 0 ? 0U :
+        static_cast<UInt32>(controller->customScanResultsCount);
+    if (output->count > RTL8822C_SCAN_SNAPSHOT_MAX_ENTRIES)
+        output->count = RTL8822C_SCAN_SNAPSHOT_MAX_ENTRIES;
+    output->entrySize = sizeof(RTL8822CUserClientScanEntry);
+
+    uint64_t now = 0;
+    clock_get_uptime(&now);
+    for (UInt32 index = 0; index < output->count; index++) {
+        const RTL8822CScanResult& source = controller->customScanResults[index];
+        RTL8822CUserClientScanEntry& entry = output->entries[index];
+        memcpy(entry.bssid, source.bssid, sizeof(entry.bssid));
+        entry.ssidLength = source.hidden ? 0 : source.ssidLength;
+        entry.securityMode = source.security_mode;
+        entry.rssi = source.rssi;
+        entry.primaryChannel = source.channel > 0 ?
+            static_cast<UInt16>(source.channel) : 0;
+        entry.centerChannel = source.vht_center_segment0 != 0 ?
+            source.vht_center_segment0 : entry.primaryChannel;
+        entry.bandwidth = source.vht_channel_width != 0 ? 80U :
+            ((source.ht_operation_info & 0x03U) != 0 ? 40U : 20U);
+        entry.flags = (source.hidden ? kRTL8822CScanEntryHidden : 0U) |
+            (source.is_secure ? kRTL8822CScanEntrySecure : 0U) |
+            (source.supports_cck ? kRTL8822CScanEntryCck : 0U) |
+            (source.supports_ht ? kRTL8822CScanEntryHt : 0U) |
+            (source.supports_vht ? kRTL8822CScanEntryVht : 0U) |
+            (source.supports_wmm ? kRTL8822CScanEntryWmm : 0U) |
+            (rtwChannelCanTransmit(source.channel) ?
+                kRTL8822CScanEntryConnectable : 0U) |
+            (rtwChannelRequiresDfs(source.channel) ?
+                kRTL8822CScanEntryDfsRequired : 0U);
+        if (!source.hidden && source.ssidLength > 0)
+            memcpy(entry.ssid, source.ssid, source.ssidLength);
+        if (source.last_seen_time != 0 && now >= source.last_seen_time) {
+            UInt64 ageNs = 0;
+            absolutetime_to_nanoseconds(now - source.last_seen_time, &ageNs);
+            UInt64 ageMs = ageNs / 1000000ULL;
+            entry.lastSeenAgeMs = ageMs > UINT32_MAX ? UINT32_MAX :
+                static_cast<UInt32>(ageMs);
+        }
+    }
+    return kIOReturnSuccess;
+}
+
+IOReturn RealtekRTL8822C::copyUserClientScanSnapshot(
+    RTL8822CUserClientScanSnapshot* snapshot) {
+    if (!snapshot) return kIOReturnBadArgument;
+    return executeCommand(this,
+                          &RealtekRTL8822C::copyUserClientScanSnapshotAction,
+                          this, snapshot);
 }
 
 IOReturn RealtekRTL8822C::newUserClient(task_t owningTask, void* securityID,
@@ -965,12 +1109,17 @@ IOReturn RealtekRTL8822C::executeUserClientCommand(
         case kRTL8822CUserCommandConnect:
             if (emptySsid || command.enabled != 0) return kIOReturnBadArgument;
             break;
+        case kRTL8822CUserCommandDirectedScan:
+            if (emptySsid || !emptyPassword || command.enabled != 0)
+                return kIOReturnBadArgument;
+            break;
         case kRTL8822CUserCommandSetInterfaceEnabled:
             if (!emptySsid || !emptyPassword) return kIOReturnBadArgument;
             break;
         case kRTL8822CUserCommandUpdateStatus:
         case kRTL8822CUserCommandScan:
         case kRTL8822CUserCommandDisconnect:
+        case kRTL8822CUserCommandCancelConnection:
             if (!emptySsid || !emptyPassword || command.enabled != 0)
                 return kIOReturnBadArgument;
             break;
@@ -982,8 +1131,12 @@ IOReturn RealtekRTL8822C::executeUserClientCommand(
     switch (command.command) {
         case kRTL8822CUserCommandUpdateStatus: name = "UpdateStatus"; break;
         case kRTL8822CUserCommandScan: name = "Scan"; break;
+        case kRTL8822CUserCommandDirectedScan: name = "DirectedScan"; break;
         case kRTL8822CUserCommandConnect: name = "Connect"; break;
         case kRTL8822CUserCommandDisconnect: name = "Disconnect"; break;
+        case kRTL8822CUserCommandCancelConnection:
+            name = "CancelConnection";
+            break;
         case kRTL8822CUserCommandSetInterfaceEnabled:
             name = "SetInterfaceEnabled";
             break;
@@ -1012,6 +1165,13 @@ IOReturn RealtekRTL8822C::executeUserClientCommand(
         }
         OSSafeReleaseNULL(ssid);
         OSSafeReleaseNULL(password);
+    } else if (command.command == kRTL8822CUserCommandDirectedScan) {
+        OSString* ssid = OSString::withCString(command.ssid);
+        if (ssid) {
+            dictionary->setObject("SSID", ssid);
+            result = setProperties(dictionary);
+        }
+        OSSafeReleaseNULL(ssid);
     } else {
         if (command.command == kRTL8822CUserCommandSetInterfaceEnabled) {
             dictionary->setObject("Enabled", command.enabled ? kOSBooleanTrue :
@@ -1075,8 +1235,13 @@ bool RealtekRTL8822C::init(OSDictionary* dictionary) {
     debugBeqLastSlot = 0; debugBeqLastWifiLen = 0; debugBeqLastPsbLen = 0;
     debugBeqFaults = 0; debugBeqRecoveries = 0;
     customScanResultsCount = 0;
+    scanResultsGeneration = 0;
     lastScanCompletedTime = 0;
     connState = CONN_STATE_DISCONNECTED;
+    linkEventGeneration = 0;
+    connectionAttemptGeneration = 0;
+    connectionAttemptActive = false;
+    runningPendingConnect = false;
     memset(targetSsid, 0, sizeof(targetSsid));
     memset(targetBssid, 0, sizeof(targetBssid));
     targetChannel = 1;
@@ -1192,6 +1357,10 @@ bool RealtekRTL8822C::init(OSDictionary* dictionary) {
     wpaRetries = 0;
     wpaRxM1 = wpaRxM3 = wpaRxGroupM1 = 0;
     wpaMicFailures = wpaReplayDrops = wpaDecryptFailures = 0;
+    staleAttemptDrops = 0;
+    authPhaseAttemptId = 0;
+    assocPhaseAttemptId = 0;
+    wpaPhaseAttemptId = 0;
     wpaStateStartTime = 0;
     channelCalibrationValid = false;
     calibratedChannel = 0;
@@ -1231,6 +1400,10 @@ bool RealtekRTL8822C::init(OSDictionary* dictionary) {
     currentChannel.flags = APPLE80211_C_FLAG_2GHZ | APPLE80211_C_FLAG_20MHZ;
     memset(currentSsid, 0, sizeof(currentSsid));
     currentSsidLen = 0;
+    // Clear key material before discarding the target identity. Cross-attempt
+    // ANonce/replay reuse is valid on some APs, so only the current attempt's
+    // phase and replay rules may reject handshake frames.
+    resetWpaState(true);
     memset(currentBssid, 0, sizeof(currentBssid));
     authTypeLower = APPLE80211_AUTHTYPE_OPEN;
     authTypeUpper = APPLE80211_AUTHTYPE_NONE;
@@ -1283,6 +1456,7 @@ bool RealtekRTL8822C::init(OSDictionary* dictionary) {
     debugRxLastRate = 0;
     debugRxLastBw = 0;
     connectedScanIndex = 0;
+    connectedScanEndIndex = kRtwScanChannelCount;
     connectedScanOriginalRcr = 0;
     connectedScanHomePrimary = 1;
     connectedScanHomeCenter = 1;
@@ -1290,6 +1464,15 @@ bool RealtekRTL8822C::init(OSDictionary* dictionary) {
     connectedScanHomePrimaryIndex = 0;
     connectedScanPhase = 0;
     connectedScanDrainRetries = 0;
+    scanHasHome = false;
+    scanProbeRequests = 0;
+    scanProbeFailures = 0;
+    scanPassiveDwells = 0;
+    memset(scanDirectedSsid, 0, sizeof(scanDirectedSsid));
+    scanDirectedChannel = 0;
+    pendingConnectValid = false;
+    memset(pendingConnectSsid, 0, sizeof(pendingConnectSsid));
+    memset(pendingConnectPassword, 0, sizeof(pendingConnectPassword));
     scanChannel = 6;
     scanChannelFlags = APPLE80211_C_FLAG_2GHZ | APPLE80211_C_FLAG_20MHZ | APPLE80211_C_FLAG_ACTIVE;
 
@@ -1566,47 +1749,114 @@ IOReturn RealtekRTL8822C::setPropertiesGated(OSObject *properties) {
             traceEvent("scan:already-active");
             return kIOReturnBusy;
         }
-        if (connState == CONN_STATE_CONNECTED) {
-            if (!startConnectedScan()) {
-                setProperty("DriverStatus",
-                            "Connected scan could not start in the current link state");
-                return kIOReturnNotReady;
-            }
-            return kIOReturnSuccess;
-        }
-        if (connState != CONN_STATE_DISCONNECTED) {
+        if (connState != CONN_STATE_DISCONNECTED &&
+            connState != CONN_STATE_CONNECTED) {
             setProperty("DriverStatus", "Scan rejected while connection setup is active");
             traceEvent("scan:rejected-connecting");
             return kIOReturnBusy;
         }
-        RTW_DEBUG_LOG("RealtekRTL8822C: Scanning Wi-Fi channels...\n");
+        memset(scanDirectedSsid, 0, sizeof(scanDirectedSsid));
+        scanDirectedChannel = 0;
         traceEvent("scan:requested");
-        setProperty("WiFiStatus", "Scanning");
-        bool scanOk = performWifiScan();
-        setProperty("WiFiStatus", "Idle");
-        setProperty("DriverStatus", scanOk ?
-                    (customScanResultsCount > 0 ? "Scan complete" :
-                                                  "Scan complete: no networks found") :
-                    "Scan failed while programming a channel");
-        traceEvent(scanOk ? "scan:completed" : "scan:channel-program-failed");
-        return scanOk ? kIOReturnSuccess : kIOReturnIOError;
+        if (!startConnectedScan()) {
+            setProperty("DriverStatus",
+                        "Scan could not start in the current interface state");
+            return kIOReturnNotReady;
+        }
+        return kIOReturnSuccess;
+    } else if (cmd->isEqualTo("DirectedScan")) {
+        if (scanInProgress) {
+            setProperty("DriverStatus", "Directed scan already in progress");
+            return kIOReturnBusy;
+        }
+        if (connState != CONN_STATE_DISCONNECTED &&
+            connState != CONN_STATE_CONNECTED) {
+            setProperty("DriverStatus", "Directed scan rejected while connection setup is active");
+            return kIOReturnBusy;
+        }
+        OSString* ssid = OSDynamicCast(OSString, dict->getObject("SSID"));
+        if (!ssid || ssid->getLength() == 0 || ssid->getLength() > 32)
+            return kIOReturnBadArgument;
+        strlcpy(scanDirectedSsid, ssid->getCStringNoCopy(),
+                sizeof(scanDirectedSsid));
+        scanDirectedChannel = 0;
+        for (int index = 0; index < customScanResultsCount; index++) {
+            if (strcmp(customScanResults[index].ssid, scanDirectedSsid) == 0) {
+                scanDirectedChannel = (UInt8)customScanResults[index].channel;
+                break;
+            }
+        }
+        traceEvent("scan:directed-requested");
+        if (!startConnectedScan()) {
+            memset(scanDirectedSsid, 0, sizeof(scanDirectedSsid));
+            scanDirectedChannel = 0;
+            setProperty("DriverStatus", "Directed scan could not start");
+            return kIOReturnNotReady;
+        }
+        return kIOReturnSuccess;
     } else if (cmd->isEqualTo("Disconnect")) {
         disconnectFromNetwork("user", true);
         return kIOReturnSuccess;
-    } else if (cmd->isEqualTo("Connect")) {
+    } else if (cmd->isEqualTo("CancelConnection")) {
         if (scanInProgress) {
-            setProperty("DriverStatus", "Connect rejected while off-channel scan is active");
-            traceEvent("connect:rejected-scan-active");
-            return kIOReturnBusy;
+            finishConnectedScan(true, "connection-cancelled", true);
+            if (connectionAttemptActive)
+                publishConnectionAttempt("terminal", "cancelled", "cancelled");
+            setProperty("DriverStatus", "Pending connection cancelled");
+            if (connState == CONN_STATE_DISCONNECTED)
+                setProperty("WiFiStatus", "Cancelled");
+            traceEvent("connect:cancelled-during-scan");
+            return kIOReturnSuccess;
         }
+        if (connState == CONN_STATE_CONNECTING_AUTH ||
+            connState == CONN_STATE_CONNECTING_ASSOC ||
+            (connState == CONN_STATE_CONNECTED && !portAuthorized)) {
+            disconnectFromNetwork("connection-cancelled", false);
+            setProperty("WiFiStatus", "Cancelled");
+            setProperty("DriverStatus", "Connection attempt cancelled");
+            traceEvent("connect:cancelled");
+            return kIOReturnSuccess;
+        }
+        clearPendingConnect();
+        if (connectionAttemptActive)
+            publishConnectionAttempt("terminal", "cancelled", "cancelled");
+        return kIOReturnSuccess;
+    } else if (cmd->isEqualTo("Connect")) {
         OSString *ssid = OSDynamicCast(OSString, dict->getObject("SSID"));
         if (!ssid) return kIOReturnBadArgument;
+        if (scanInProgress) {
+            const char* requestedSsid = ssid->getCStringNoCopy();
+            OSString* password = OSDynamicCast(OSString,
+                                               dict->getObject("Password"));
+            const char* passwordText = password ? password->getCStringNoCopy() : "";
+            if (!requestedSsid || strlen(requestedSsid) > 32 ||
+                !passwordText || strlen(passwordText) > 64)
+                return kIOReturnBadArgument;
+
+            if (pendingConnectValid && connectionAttemptActive)
+                publishConnectionAttempt("terminal", "cancelled", "replaced");
+            clearPendingConnect();
+            strlcpy(pendingConnectSsid, requestedSsid,
+                    sizeof(pendingConnectSsid));
+            strlcpy(pendingConnectPassword, passwordText,
+                    sizeof(pendingConnectPassword));
+            pendingConnectValid = true;
+            beginConnectionAttempt(requestedSsid, "queued");
+            setProperty("ConnectionQueueState",
+                        "queued=1 policy=latest-wins trigger=scan-complete");
+            setProperty("DriverStatus",
+                        "Connection queued until active scan completes");
+            traceEvent("connect:queued-after-scan");
+            return kIOReturnSuccess;
+        }
 
         const char* requestedSsid = ssid->getCStringNoCopy();
         bool sameTarget = requestedSsid && strcmp(targetSsid, requestedSsid) == 0;
         if (connState == CONN_STATE_CONNECTED && sameTarget && portAuthorized) {
             traceEvent("connect:already-connected");
             setProperty("WiFiStatus", "Connected");
+            if (runningPendingConnect && connectionAttemptActive)
+                publishConnectionAttempt("connected", "success", "none");
             return kIOReturnSuccess;
         }
         if (connState == CONN_STATE_CONNECTED && sameTarget && !portAuthorized) {
@@ -1620,13 +1870,8 @@ IOReturn RealtekRTL8822C::setPropertiesGated(OSObject *properties) {
             // Treat a new command as an intentional replacement attempt.
             traceEvent("connect:restart-pending-attempt");
         }
-        if (connState != CONN_STATE_DISCONNECTED) {
-            disconnectFromNetwork("reconnect", connState == CONN_STATE_CONNECTED);
-        }
-
         RTW_DEBUG_LOG("RealtekRTL8822C: Request to connect to SSID: %s\n", ssid->getCStringNoCopy());
         traceEvent("connect:requested");
-        setProperty("WiFiStatus", "Connecting");
         int found_idx = -1;
         for (int i = 0; i < customScanResultsCount; i++) {
             if (strcmp(customScanResults[i].ssid, ssid->getCStringNoCopy()) == 0) {
@@ -1656,28 +1901,10 @@ IOReturn RealtekRTL8822C::setPropertiesGated(OSObject *properties) {
             traceEvent("connect:recent-scan-cache");
             setProperty("DriverStatus", "Using recent scan result for connection");
         } else {
-            // Refresh stale or missing entries so a hotspot security/channel
-            // change cannot reuse an old Open/RSN description. A recent
-            // explicit scan is authoritative and must not be immediately
-            // replaced by a second five-second sweep that can miss a weak AP.
-            traceEvent("connect:refresh-scan");
-            setProperty("DriverStatus", "Refreshing stale scan before connection");
-            if (!performWifiScan()) {
-                traceEvent("connect:refresh-scan-failed");
-                setProperty("WiFiStatus", "Failed");
-                setProperty("DriverStatus",
-                            "Connection scan failed while programming a channel");
-                return kIOReturnIOError;
-            }
-            found_idx = -1;
-            for (int i = 0; i < customScanResultsCount; i++) {
-                if (strcmp(customScanResults[i].ssid, ssid->getCStringNoCopy()) == 0) {
-                    found_idx = i;
-                    break;
-                }
-            }
-            scanAgeNs = 0;
-            resultAgeNs = 0;
+            traceEvent("connect:async-scan-required");
+            setProperty("DriverStatus",
+                        "Fresh asynchronous scan required before connection");
+            return kIOReturnNotReady;
         }
         char scanSource[192];
         snprintf(scanSource, sizeof(scanSource),
@@ -1695,6 +1922,17 @@ IOReturn RealtekRTL8822C::setPropertiesGated(OSObject *properties) {
             setProperty("DriverStatus", "Requested SSID not found in fresh scan");
             return kIOReturnNotFound;
         }
+
+        if (connState != CONN_STATE_DISCONNECTED) {
+            if (!runningPendingConnect && connectionAttemptActive)
+                publishConnectionAttempt("terminal", "cancelled", "replaced");
+            disconnectFromNetwork("reconnect", connState == CONN_STATE_CONNECTED);
+        }
+        if (runningPendingConnect)
+            publishConnectionAttempt("preparing", "pending", "none");
+        else
+            beginConnectionAttempt(requestedSsid, "preparing");
+        setProperty("WiFiStatus", "Connecting");
 
         // Save target parameters
         strlcpy(targetSsid, customScanResults[found_idx].ssid,
@@ -1750,6 +1988,8 @@ IOReturn RealtekRTL8822C::setPropertiesGated(OSObject *properties) {
             if (!wpaCryptoReady) {
                 traceEvent("connect:wpa-crypto-selftest-failed");
                 setProperty("WiFiStatus", "WPACryptoFailed");
+                publishConnectionAttempt("terminal", "failure",
+                                         "crypto-unavailable");
                 return kIOReturnNotReady;
             }
             OSString* password = OSDynamicCast(OSString, dict->getObject("Password"));
@@ -1757,6 +1997,8 @@ IOReturn RealtekRTL8822C::setPropertiesGated(OSObject *properties) {
                 traceEvent("connect:wpa-suite-unsupported");
                 setProperty("WiFiStatus", "WPAUnsupported");
                 setProperty("DriverStatus", "Only WPA2-PSK with CCMP group/pairwise cipher and optional PMF is supported");
+                publishConnectionAttempt("terminal", "failure",
+                                         "unsupported-security");
                 return kIOReturnUnsupported;
             }
             const char* passwordText = password ? password->getCStringNoCopy() : nullptr;
@@ -1773,8 +2015,15 @@ IOReturn RealtekRTL8822C::setPropertiesGated(OSObject *properties) {
                 setProperty("WiFiStatus", "WPAPasswordRequired");
                 setProperty("DriverStatus", "WPA2 password must be 8-63 characters or a 64-digit hexadecimal PMK");
                 resetWpaState(true);
+                publishConnectionAttempt("terminal", "failure",
+                                         "invalid-credentials");
                 return kIOReturnBadArgument;
             }
+            // The PMK belongs to this request, but replay/nonce/PTK/GTK and
+            // remembered EAPOL state belong to the previous association.
+            // Preserve the newly derived PMK while starting a clean four-way
+            // handshake even when the AP reuses a replay counter.
+            resetWpaState(false);
             traceEvent("connect:wpa-pmk-ready");
             setProperty("DriverStatus", "WPA2 credentials accepted; starting authentication");
             publishWpaState("pmk-derived");
@@ -1783,15 +2032,17 @@ IOReturn RealtekRTL8822C::setPropertiesGated(OSObject *properties) {
             setProperty("DriverStatus", "Open-network authentication started");
         }
 
-        bool allowed5GPrimary = targetChannel == 36 || targetChannel == 40 ||
-                                targetChannel == 44 || targetChannel == 48 ||
-                                targetChannel == 149 || targetChannel == 153 ||
-                                targetChannel == 157 || targetChannel == 161 ||
-                                targetChannel == 165;
-        if (targetChannel > 14 && !allowed5GPrimary) {
-            traceEvent("connect:5g-channel-blocked");
-            setProperty("WiFiStatus", "5GHzChannelBlocked");
-            setProperty("DriverStatus", "5 GHz TX is restricted to FCC/US non-DFS channels 36/40/44/48 and 149/153/157/161/165");
+        if (!rtwChannelCanTransmit(targetChannel)) {
+            traceEvent(rtwChannelRequiresDfs(targetChannel) ?
+                "connect:dfs-channel-blocked" : "connect:channel-blocked");
+            setProperty("WiFiStatus", rtwChannelRequiresDfs(targetChannel) ?
+                "DFSChannelBlocked" : "ChannelBlocked");
+            setProperty("DriverStatus", rtwChannelRequiresDfs(targetChannel) ?
+                "DFS transmission requires regulatory-domain, CAC and radar handling that is not implemented yet" :
+                "Transmission on this channel is not authorized by the current regulatory policy");
+            publishConnectionAttempt("terminal", "failure",
+                                     rtwChannelRequiresDfs(targetChannel) ?
+                                         "dfs-unavailable" : "channel-blocked");
             return kIOReturnUnsupported;
         }
 
@@ -1849,6 +2100,8 @@ IOReturn RealtekRTL8822C::setPropertiesGated(OSObject *properties) {
                           targetPrimaryChannelIndex)) {
             traceEvent("connect:channel-program-failed");
             setProperty("WiFiStatus", "ChannelProgramFailed");
+            publishConnectionAttempt("terminal", "failure",
+                                     "channel-program-failed");
             return kIOReturnIOError;
         }
         if (targetChannel > 14 &&
@@ -1858,6 +2111,8 @@ IOReturn RealtekRTL8822C::setPropertiesGated(OSObject *properties) {
             traceEvent("connect:5g-tx-power-invalid");
             setProperty("WiFiStatus", "5GHzPowerInvalid");
             setProperty("DriverStatus", "5 GHz association blocked because the calibrated FCC TX power profile is invalid");
+            publishConnectionAttempt("terminal", "failure",
+                                     "tx-power-invalid");
             return kIOReturnNotReady;
         }
         RTW_DEBUG_PROPERTY("Debug_TXDMA_Status_AfterChannel", (uint64_t)read32(0x0210), 32);
@@ -1922,6 +2177,8 @@ IOReturn RealtekRTL8822C::setPropertiesGated(OSObject *properties) {
         } else {
             traceEvent("auth:queue-failed");
             setProperty("WiFiStatus", "Failed");
+            publishConnectionAttempt("terminal", "failure",
+                                     "auth-queue-failed");
             return kIOReturnError;
         }
     }
@@ -1978,7 +2235,7 @@ void RealtekRTL8822C::publishDebugSnapshot() {
              baEstablished ? 1 : 0, portAuthorized ? 1 : 0,
              (int)wpaState, (unsigned int)wpaRxM1, (unsigned int)wpaRxM3);
     RTW_DEBUG_PROPERTY("Debug_Snapshot", snapshot);
-    RTW_DEBUG_PROPERTY("Debug_Diagnostics_Revision", "0.0.2");
+    RTW_DEBUG_PROPERTY("Debug_Diagnostics_Revision", "0.0.3-full-band-passive-scan");
     RTW_DEBUG_PROPERTY("Debug_HotPath_Diagnostics",
                        "profile=Debug sample=1/1024 ordinary-tx-rx");
 #endif
@@ -1986,8 +2243,48 @@ void RealtekRTL8822C::publishDebugSnapshot() {
 
 void RealtekRTL8822C::publishConnectedScanState(const char* state) {
     if (!state) return;
+    setProperty("ScanState", state);
     setProperty("ConnectedScanState", state);
     RTW_DEBUG_PROPERTY("Debug_Connected_Scan", state);
+}
+
+void RealtekRTL8822C::publishLinkEvent(const char* type, const char* ssid,
+                                      const char* reason) {
+    linkEventGeneration++;
+    if (linkEventGeneration == 0) linkEventGeneration = 1;
+    setProperty("LinkEventGeneration", (uint64_t)linkEventGeneration, 32);
+    setProperty("LinkEventType", type ? type : "unknown");
+    if (ssid && ssid[0] != '\0') setProperty("LinkEventSSID", ssid);
+    else removeProperty("LinkEventSSID");
+    setProperty("LinkEventReason", reason ? reason : "unknown");
+}
+
+void RealtekRTL8822C::beginConnectionAttempt(const char* ssid,
+                                             const char* phase) {
+    connectionAttemptGeneration++;
+    if (connectionAttemptGeneration == 0) connectionAttemptGeneration = 1;
+    connectionAttemptActive = true;
+    authPhaseAttemptId = 0;
+    assocPhaseAttemptId = 0;
+    wpaPhaseAttemptId = 0;
+    setProperty("ConnectionAttemptID",
+                (uint64_t)connectionAttemptGeneration, 32);
+    if (ssid && ssid[0] != '\0') setProperty("ConnectionTargetSSID", ssid);
+    else removeProperty("ConnectionTargetSSID");
+    publishConnectionAttempt(phase ? phase : "preparing", "pending", "none");
+}
+
+void RealtekRTL8822C::publishConnectionAttempt(const char* phase,
+                                               const char* result,
+                                               const char* failureCode) {
+    setProperty("ConnectionAttemptID",
+                (uint64_t)connectionAttemptGeneration, 32);
+    setProperty("ConnectionPhase", phase ? phase : "unknown");
+    setProperty("ConnectionResult", result ? result : "pending");
+    setProperty("ConnectionFailureCode",
+                failureCode ? failureCode : "none");
+    if (result && strcmp(result, "pending") != 0)
+        connectionAttemptActive = false;
 }
 
 void RealtekRTL8822C::activateNetworkDataPath(const char* reason) {
@@ -2017,6 +2314,10 @@ void RealtekRTL8822C::activateNetworkDataPath(const char* reason) {
              (unsigned int)(netif ? netif->getFlags() : 0),
              (netif && (netif->getFlags() & IFF_UP)) ? 1 : 0);
     RTW_DEBUG_PROPERTY("Debug_Link_Lifecycle", db);
+    if (connectionAttemptActive)
+        publishConnectionAttempt("connected", "success", "none");
+    publishLinkEvent("connected", targetSsid,
+                     reason ? reason : "data-path-active");
     traceEvent("link:data-path-active");
 }
 
@@ -2024,6 +2325,15 @@ void RealtekRTL8822C::runConnectionWatchdog() {
     reconcileInterfaceStateFromBsd();
     processRxReorderTimeouts();
     if (connState == CONN_STATE_CONNECTING_AUTH || connState == CONN_STATE_CONNECTING_ASSOC) {
+        UInt32 phaseAttempt = connState == CONN_STATE_CONNECTING_AUTH ?
+            authPhaseAttemptId : assocPhaseAttemptId;
+        if (!connectionAttemptActive ||
+            phaseAttempt != connectionAttemptGeneration) {
+            staleAttemptDrops++;
+            traceEvent("connect:stale-phase-state-reset");
+            disconnectFromNetwork("stale-attempt-state", false);
+            return;
+        }
         uint64_t currentTime;
         clock_get_uptime(&currentTime);
         uint64_t elapsedNs = 0;
@@ -2046,6 +2356,13 @@ void RealtekRTL8822C::runConnectionWatchdog() {
 
     if (connState == CONN_STATE_CONNECTED && targetSecurityMode == SECURITY_WPA2 &&
         !portAuthorized && (wpaState == WPA_STATE_WAIT_M1 || wpaState == WPA_STATE_WAIT_M3)) {
+        if (!connectionAttemptActive ||
+            wpaPhaseAttemptId != connectionAttemptGeneration) {
+            staleAttemptDrops++;
+            traceEvent("wpa:stale-phase-state-reset");
+            disconnectFromNetwork("stale-attempt-state", false);
+            return;
+        }
         uint64_t now;
         clock_get_uptime(&now);
         uint64_t elapsedNs = 0;
@@ -2332,6 +2649,7 @@ void RealtekRTL8822C::rxPacketPoolTimerFired(OSObject* owner,
 }
 
 void RealtekRTL8822C::free(void) {
+    clearPendingConnect();
     teardownRxPacketPool();
     resetRxBaSessions(false);
     resetWpaState(true);
@@ -3200,6 +3518,12 @@ bool RealtekRTL8822C::start(IOService* provider) {
     setProperty("DriverStatus", "Started IOEthernetController");
     setProperty("DriverVersion", RTW_VERSION);
     setProperty("BuildConfiguration", RTW_DEBUG ? "Debug" : "Release");
+    setProperty("DriverBuildTargetMacOS", RTW_DRIVER_BUILD_TARGET);
+    setProperty("ConnectionAttemptID", (uint64_t)0, 32);
+    setProperty("ConnectionPhase", "idle");
+    setProperty("ConnectionResult", "none");
+    setProperty("ConnectionFailureCode", "none");
+    setProperty("ScanGeneration", (uint64_t)0, 32);
     setProperty("InterfaceUserEnabled", kOSBooleanTrue);
     setProperty("PowerState", "Awake");
     RTW_DEBUG_PROPERTY("Debug_PM_Provider_Managed", true);
@@ -3692,6 +4016,7 @@ bool RealtekRTL8822C::start(IOService* provider) {
 
 void RealtekRTL8822C::stop(IOService* provider) {
     RTW_DEBUG_LOG("RealtekRTL8822C: Stopping...\n");
+    clearPendingConnect();
     if (hardwareReady && !hardwareSuspended) suspendHardware();
     hardwareReady = false;
     portAuthorized = false;
@@ -5728,7 +6053,7 @@ void RealtekRTL8822C::publishWpaState(const char* event) {
     else if (wpaState == WPA_STATE_COMPLETED) state = "completed";
     char security[320];
     snprintf(security, sizeof(security),
-             "mode=%s state=%s event=%s port=%s pmk=%d ptk=%d gtk=%d gtk_id=%u replay=%llu txpn=%llu m1=%u m3=%u group1=%u mic_fail=%u replay_drop=%u unwrap_fail=%u",
+             "mode=%s state=%s event=%s port=%s pmk=%d ptk=%d gtk=%d gtk_id=%u replay=%llu txpn=%llu m1=%u m3=%u group1=%u mic_fail=%u replay_drop=%u unwrap_fail=%u stale_attempt=%u",
              targetSecurityMode == SECURITY_WPA2 ? "wpa2-psk-ccmp" :
              (targetSecurityMode == SECURITY_OPEN ? "open" : "unsupported"),
              state, event ? event : "none", portAuthorized ? "authorized" : "eapol-only",
@@ -5737,7 +6062,8 @@ void RealtekRTL8822C::publishWpaState(const char* event) {
              (unsigned long long)wpaLastReplay, (unsigned long long)wpaTxPn,
              (unsigned int)wpaRxM1, (unsigned int)wpaRxM3,
              (unsigned int)wpaRxGroupM1, (unsigned int)wpaMicFailures,
-             (unsigned int)wpaReplayDrops, (unsigned int)wpaDecryptFailures);
+             (unsigned int)wpaReplayDrops, (unsigned int)wpaDecryptFailures,
+             (unsigned int)staleAttemptDrops);
     RTW_DEBUG_PROPERTY("Debug_Security_State", security);
 #else
     (void)event;
@@ -5879,11 +6205,24 @@ bool RealtekRTL8822C::handleWpaMessage1(const UInt8* eapol, UInt32 len,
         publishWpaState("m1-replay-drop");
         return false;
     }
-    if (wpaState == WPA_STATE_WAIT_M3 && replay == wpaM1Replay &&
-        memcmp(wpaAnonce, eapol + 17, 32) == 0 && wpaLastTxLen != 0) {
-        bool sent = sendEapolKeyFrame(wpaLastTx, wpaLastTxLen, false, false);
-        if (sent) traceEvent("wpa:m2-retransmit-on-m1");
-        return sent;
+    if (wpaState == WPA_STATE_WAIT_M3) {
+        if (replay < wpaM1Replay) {
+            staleAttemptDrops++;
+            publishWpaState("m1-older-transaction-drop");
+            return false;
+        }
+        if (replay == wpaM1Replay) {
+            if (memcmp(wpaAnonce, eapol + 17, 32) != 0) {
+                staleAttemptDrops++;
+                publishWpaState("m1-replay-anonce-mismatch");
+                return false;
+            }
+            if (wpaLastTxLen == 0) return false;
+            bool sent = sendEapolKeyFrame(wpaLastTx, wpaLastTxLen,
+                                          false, false);
+            if (sent) traceEvent("wpa:m2-retransmit-on-m1");
+            return sent;
+        }
     }
     memcpy(wpaAnonce, eapol + 17, sizeof(wpaAnonce));
     if (random_buf(wpaSnonce, sizeof(wpaSnonce)) != 0) {
@@ -6065,6 +6404,13 @@ bool RealtekRTL8822C::handleWpaGroupMessage1(const UInt8* eapol, UInt32 len,
 bool RealtekRTL8822C::handleEapolKey(const UInt8* eapol, UInt32 len) {
     if (targetSecurityMode != SECURITY_WPA2 || !eapol || len < 99 ||
         eapol[1] != 3 || eapol[4] != 2) return false;
+    if (!portAuthorized &&
+        (!connectionAttemptActive ||
+         wpaPhaseAttemptId != connectionAttemptGeneration)) {
+        staleAttemptDrops++;
+        publishWpaState("eapol-stale-attempt-drop");
+        return false;
+    }
     UInt32 total = 4U + rtwReadBe16(eapol + 2);
     if (total < 99 || total > len || 99U + rtwReadBe16(eapol + 97) > total) return false;
     UInt16 keyInfo = rtwReadBe16(eapol + 5);
@@ -8798,6 +9144,53 @@ bool RealtekRTL8822C::transmitWifiFrame(const UInt8* frame, UInt32 len, UInt8 qs
     return true;
 }
 
+bool RealtekRTL8822C::sendProbeRequest(const char* ssid) {
+    size_t ssidLength = ssid ? strnlen(ssid, 33) : 0;
+    if (ssidLength > 32) return false;
+
+    UInt8 frame[128];
+    memset(frame, 0, sizeof(frame));
+    frame[0] = 0x40; // Probe Request
+    memset(frame + 4, 0xff, 6);
+    memcpy(frame + 10, macAddress, 6);
+    memset(frame + 16, 0xff, 6);
+
+    UInt32 offset = 24;
+    frame[offset++] = 0; // SSID
+    frame[offset++] = static_cast<UInt8>(ssidLength);
+    if (ssidLength != 0) {
+        memcpy(frame + offset, ssid, ssidLength);
+        offset += static_cast<UInt32>(ssidLength);
+    }
+
+    frame[offset++] = 1; // Supported Rates
+    if (scanChannel > 14) {
+        static const UInt8 rates5G[] = {
+            0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c
+        };
+        frame[offset++] = sizeof(rates5G);
+        memcpy(frame + offset, rates5G, sizeof(rates5G));
+        offset += sizeof(rates5G);
+    } else {
+        static const UInt8 rates2G[] = {
+            0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24
+        };
+        static const UInt8 extended2G[] = { 0x30, 0x48, 0x60, 0x6c };
+        frame[offset++] = sizeof(rates2G);
+        memcpy(frame + offset, rates2G, sizeof(rates2G));
+        offset += sizeof(rates2G);
+        frame[offset++] = 50; // Extended Supported Rates
+        frame[offset++] = sizeof(extended2G);
+        memcpy(frame + offset, extended2G, sizeof(extended2G));
+        offset += sizeof(extended2G);
+    }
+
+    bool queued = transmitWifiFrame(frame, offset, 18);
+    scanProbeRequests++;
+    if (!queued) scanProbeFailures++;
+    return queued;
+}
+
 bool RealtekRTL8822C::restoreConnectedScanHome() {
     if (!ioBase || connState != CONN_STATE_CONNECTED) return false;
     bool channelOk = setChannelHw(connectedScanHomeCenter, 0,
@@ -8812,16 +9205,69 @@ bool RealtekRTL8822C::restoreConnectedScanHome() {
     return channelOk && powerOk;
 }
 
+void RealtekRTL8822C::clearPendingConnect() {
+    pendingConnectValid = false;
+    memset(pendingConnectSsid, 0, sizeof(pendingConnectSsid));
+    RtwWpaCrypto::secureZero(pendingConnectPassword,
+                             sizeof(pendingConnectPassword));
+    removeProperty("ConnectionQueueState");
+}
+
+IOReturn RealtekRTL8822C::runPendingConnect() {
+    if (!pendingConnectValid) return kIOReturnNotReady;
+
+    char ssid[sizeof(pendingConnectSsid)];
+    char password[sizeof(pendingConnectPassword)];
+    memcpy(ssid, pendingConnectSsid, sizeof(ssid));
+    memcpy(password, pendingConnectPassword, sizeof(password));
+    clearPendingConnect();
+
+    OSDictionary* dictionary = OSDictionary::withCapacity(3);
+    OSString* command = OSString::withCString("Connect");
+    OSString* ssidObject = OSString::withCString(ssid);
+    OSString* passwordObject = OSString::withCString(password);
+    IOReturn result = kIOReturnNoMemory;
+    if (dictionary && command && ssidObject && passwordObject) {
+        dictionary->setObject("Command", command);
+        dictionary->setObject("SSID", ssidObject);
+        dictionary->setObject("Password", passwordObject);
+        traceEvent("connect:dequeued-after-scan");
+        runningPendingConnect = true;
+        result = setPropertiesGated(dictionary);
+        runningPendingConnect = false;
+    }
+
+    OSSafeReleaseNULL(passwordObject);
+    OSSafeReleaseNULL(ssidObject);
+    OSSafeReleaseNULL(command);
+    OSSafeReleaseNULL(dictionary);
+    RtwWpaCrypto::secureZero(password, sizeof(password));
+    memset(ssid, 0, sizeof(ssid));
+
+    if (result != kIOReturnSuccess) {
+        if (connectionAttemptActive)
+            publishConnectionAttempt("terminal", "failure",
+                                     result == kIOReturnNotFound ?
+                                        "not-found" : "start-failed");
+        setProperty("DriverStatus",
+                    "Queued connection could not start after scan");
+        traceEvent("connect:dequeued-failed");
+    }
+    return result;
+}
+
 void RealtekRTL8822C::finishConnectedScan(bool cancelled, const char* reason,
                                        bool restoreHome) {
     if (offchannelScanTimer) offchannelScanTimer->cancelTimeout();
+    bool hadHome = scanHasHome;
     bool restored = true;
-    if (restoreHome && connState == CONN_STATE_CONNECTED)
+    if (hadHome && restoreHome && connState == CONN_STATE_CONNECTED)
         restored = restoreConnectedScanHome();
     else if (ioBase)
         write32(0x0608, connectedScanOriginalRcr);
 
     scanInProgress = false;
+    scanHasHome = false;
     connectedScanPhase = 0;
     publishScanResults();
     if (!cancelled && restored) clock_get_uptime(&lastScanCompletedTime);
@@ -8831,87 +9277,135 @@ void RealtekRTL8822C::finishConnectedScan(bool cancelled, const char* reason,
         connState == CONN_STATE_CONNECTED && portAuthorized)
         queue->start();
 
-    char scanDb[256];
+    bool directed = scanDirectedSsid[0] != '\0';
+    char scanDb[320];
     snprintf(scanDb, sizeof(scanDb),
-             "available=1 active=0 result=%s reason=%s restored=%d count=%d home=%u/%u/%u idx=%u",
+             "available=1 active=0 mode=%s result=%s reason=%s restored=%d directed=%d count=%d probes=%u probe_fail=%u passive=%u home=%u/%u/%u idx=%u",
+             hadHome ? "connected" : "disconnected",
              cancelled ? "cancelled" : "complete", reason ? reason : "none",
-             restored ? 1 : 0, customScanResultsCount,
+             restored ? 1 : 0, directed ? 1 : 0, customScanResultsCount,
+             (unsigned int)scanProbeRequests,
+             (unsigned int)scanProbeFailures,
+             (unsigned int)scanPassiveDwells,
              (unsigned int)connectedScanHomePrimary,
              (unsigned int)connectedScanHomeCenter,
              connectedScanHomeBandwidth == 2 ? 80U :
              (connectedScanHomeBandwidth == 1 ? 40U : 20U),
              connectedScanHomePrimaryIndex);
     publishConnectedScanState(scanDb);
-    if (!cancelled && restored && connState == CONN_STATE_CONNECTED) {
+    memset(scanDirectedSsid, 0, sizeof(scanDirectedSsid));
+    scanDirectedChannel = 0;
+    if (!cancelled && restored && hadHome && connState == CONN_STATE_CONNECTED) {
         setProperty("WiFiStatus", "Connected");
         setProperty("DriverStatus", customScanResultsCount > 0 ?
                     "Connected scan complete" :
                     "Connected scan complete: no networks found");
         traceEvent("scan:connected-complete");
-    } else if (!restored && connState == CONN_STATE_CONNECTED) {
+    } else if (!cancelled && restored && !hadHome &&
+               connState == CONN_STATE_DISCONNECTED) {
+        setProperty("WiFiStatus", "Idle");
+        setProperty("DriverStatus", customScanResultsCount > 0 ?
+                    "Scan complete" : "Scan complete: no networks found");
+        traceEvent("scan:disconnected-complete");
+    } else if (!restored && hadHome && connState == CONN_STATE_CONNECTED) {
         setProperty("DriverStatus", "Connected scan cancelled: home channel restore failed");
         traceEvent("scan:restore-failed");
     } else {
         char cancelledStatus[192];
         snprintf(cancelledStatus, sizeof(cancelledStatus),
-                 "Connected scan cancelled: %s",
+                 "%s scan cancelled: %s",
+                 hadHome ? "Connected" : "Disconnected",
                  reason ? reason : "unknown reason");
         setProperty("DriverStatus", cancelledStatus);
-        traceEvent("scan:connected-cancelled");
+        if (!hadHome && connState == CONN_STATE_DISCONNECTED)
+            setProperty("WiFiStatus", "Idle");
+        traceEvent(hadHome ? "scan:connected-cancelled" :
+                             "scan:disconnected-cancelled");
+    }
+
+    if (pendingConnectValid) {
+        if (!cancelled && restored)
+            (void)runPendingConnect();
+        else {
+            if (connectionAttemptActive)
+                publishConnectionAttempt("terminal", "cancelled",
+                                         reason ? reason : "scan-cancelled");
+            clearPendingConnect();
+        }
     }
 }
 
 bool RealtekRTL8822C::startConnectedScan() {
+    bool connected = connState == CONN_STATE_CONNECTED && portAuthorized;
+    bool disconnected = connState == CONN_STATE_DISCONNECTED;
     if (!offchannelScanTimer || scanInProgress ||
-        connState != CONN_STATE_CONNECTED || !portAuthorized)
+        (!connected && !disconnected))
         return false;
 
+    scanHasHome = connected;
     connectedScanOriginalRcr = read32(0x0608);
-    connectedScanHomePrimary = (UInt32)targetChannel;
-    connectedScanHomeCenter = (UInt32)targetCenterChannel;
-    connectedScanHomeBandwidth = targetBandwidth;
-    connectedScanHomePrimaryIndex = targetPrimaryChannelIndex;
+    connectedScanHomePrimary = connected ? (UInt32)targetChannel : 0;
+    connectedScanHomeCenter = connected ? (UInt32)targetCenterChannel : 0;
+    connectedScanHomeBandwidth = connected ? targetBandwidth : 0;
+    connectedScanHomePrimaryIndex = connected ? targetPrimaryChannelIndex : 0;
     pruneScanResults(300000000000ULL);
     connectedScanIndex = 0;
+    connectedScanEndIndex = kRtwScanChannelCount;
+    if (scanDirectedChannel != 0) {
+        for (UInt32 index = 0; index < kRtwScanChannelCount; index++) {
+            if (kRtwScanChannels[index].channel == scanDirectedChannel) {
+                connectedScanIndex = index;
+                connectedScanEndIndex = index + 1;
+                break;
+            }
+        }
+    }
     connectedScanPhase = 1; // drain BEQ before the first excursion
     connectedScanDrainRetries = 0;
+    scanProbeRequests = 0;
+    scanProbeFailures = 0;
+    scanPassiveDwells = 0;
     lastScanCompletedTime = 0;
     scanInProgress = true;
 
     IOOutputQueue* queue = getOutputQueue();
-    if (queue) queue->stop();
-    setProperty("DriverStatus", "Connected off-channel scan started");
+    if (connected && queue) queue->stop();
+    if (!connected) setProperty("WiFiStatus", "Scanning");
+    setProperty("DriverStatus", scanDirectedSsid[0] ?
+                "Directed asynchronous scan started" :
+                (connected ? "Connected off-channel scan started" :
+                             "Asynchronous channel scan started"));
     char scanDb[192];
     snprintf(scanDb, sizeof(scanDb),
-             "available=1 active=1 phase=drain channel=0 index=0 home=%u/%u/%u idx=%u",
+             "available=1 active=1 mode=%s phase=%s channel=0 index=0 home=%u/%u/%u idx=%u",
+             connected ? "connected" : "disconnected",
+             connected ? "drain" : "prepare",
              (unsigned int)connectedScanHomePrimary,
              (unsigned int)connectedScanHomeCenter,
              connectedScanHomeBandwidth == 2 ? 80U :
              (connectedScanHomeBandwidth == 1 ? 40U : 20U),
              connectedScanHomePrimaryIndex);
     publishConnectedScanState(scanDb);
-    traceEvent("scan:connected-start");
+    traceEvent(connected ? "scan:connected-start" :
+                           "scan:disconnected-start");
     offchannelScanTimer->setTimeoutMS(1);
     return true;
 }
 
 void RealtekRTL8822C::advanceConnectedScan(IOTimerEventSource* sender) {
-    static const UInt8 scanChannels[] = {
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-        36, 40, 44, 48, 149, 153, 157, 161, 165
-    };
-    static const UInt32 scanChannelCount = sizeof(scanChannels) / sizeof(scanChannels[0]);
     if (!scanInProgress || !sender) return;
-    if (hardwareSuspended || !interfaceEnabled ||
-        connState != CONN_STATE_CONNECTED || !portAuthorized) {
+    bool stateValid = scanHasHome ?
+        (connState == CONN_STATE_CONNECTED && portAuthorized) :
+        connState == CONN_STATE_DISCONNECTED;
+    if (hardwareSuspended || !interfaceEnabled || !stateValid) {
         finishConnectedScan(true, "link-state-changed", false);
         return;
     }
 
     if (connectedScanPhase == 1) { // drain
-        updateBeqCompletion();
+        if (scanHasHome) updateBeqCompletion();
         UInt32 outstanding = 0;
-        if (beqLock) {
+        if (scanHasHome && beqLock) {
             IOInterruptState interruptState = IOSimpleLockLockDisableInterrupt(beqLock);
             outstanding = beqOutstanding;
             IOSimpleLockUnlockEnableInterrupt(beqLock, interruptState);
@@ -8925,41 +9419,64 @@ void RealtekRTL8822C::advanceConnectedScan(IOTimerEventSource* sender) {
             return;
         }
         connectedScanDrainRetries = 0;
-        if (connectedScanIndex >= scanChannelCount) {
-            finishConnectedScan(false, "complete", true);
+        if (connectedScanIndex >= connectedScanEndIndex) {
+            finishConnectedScan(false, "complete", scanHasHome);
             return;
         }
 
-        UInt32 channel = scanChannels[connectedScanIndex];
+        const RtwScanChannel& scanTarget = kRtwScanChannels[connectedScanIndex];
+        UInt32 channel = scanTarget.channel;
         scanChannel = channel;
         UInt32 promiscuousRcr = (connectedScanOriginalRcr | 0x0fU) &
                                 ~((1U << 6) | (1U << 7));
         write32(0x0608, promiscuousRcr);
-        if (channel != connectedScanHomePrimary) {
+        if (!scanHasHome || channel != connectedScanHomePrimary) {
             UInt32 flags = channel > 14 ? APPLE80211_C_FLAG_5GHZ :
                                          APPLE80211_C_FLAG_2GHZ;
             if (!setChannelHw(channel, flags | APPLE80211_C_FLAG_20MHZ,
                               0, 0, true)) {
-                finishConnectedScan(true, "offchannel-program-failed", true);
+                finishConnectedScan(true, "offchannel-program-failed", scanHasHome);
                 return;
             }
         }
+        if (scanTarget.active) {
+            bool txReady = channel <= 14 ||
+                           (scanHasHome && channel == connectedScanHomePrimary) ||
+                           configure5GTxPower(channel, channel, 0, false);
+            if (!txReady) {
+                finishConnectedScan(true, "probe-tx-power-failed", scanHasHome);
+                return;
+            }
+            sendProbeRequest(scanDirectedSsid[0] ? scanDirectedSsid : nullptr);
+        } else {
+            scanPassiveDwells++;
+        }
         connectedScanPhase = 2; // off-channel dwell
+        UInt32 dwellMs = scanTarget.active ? 55U : 110U;
         char scanDb[192];
         snprintf(scanDb, sizeof(scanDb),
-                 "available=1 active=1 phase=dwell channel=%u index=%u/%u home=%u/%u/%u",
+                 "available=1 active=1 mode=%s phase=dwell channel=%u index=%u/%u probe=%s dwell_ms=%u home=%u/%u/%u",
+                 scanHasHome ? "connected" : "disconnected",
                  (unsigned int)channel, (unsigned int)(connectedScanIndex + 1),
-                 (unsigned int)scanChannelCount,
+                 (unsigned int)connectedScanEndIndex,
+                 scanTarget.active ? "active" : "passive",
+                 (unsigned int)dwellMs,
                  (unsigned int)connectedScanHomePrimary,
                  (unsigned int)connectedScanHomeCenter,
                  connectedScanHomeBandwidth == 2 ? 80U :
                  (connectedScanHomeBandwidth == 1 ? 40U : 20U));
         publishConnectedScanState(scanDb);
-        sender->setTimeoutMS(55);
+        sender->setTimeoutMS(dwellMs);
         return;
     }
 
     if (connectedScanPhase == 2) { // return home after every dwell
+        if (!scanHasHome) {
+            connectedScanIndex++;
+            connectedScanPhase = 1;
+            sender->setTimeoutMS(1);
+            return;
+        }
         if (!restoreConnectedScanHome()) {
             finishConnectedScan(true, "home-restore-failed", true);
             return;
@@ -8990,60 +9507,11 @@ void RealtekRTL8822C::connectedScanTimerFired(OSObject* owner,
     advanceConnectedScan(sender);
 }
 
-bool RealtekRTL8822C::performWifiScan() {
-    customScanResultsCount = 0;
-    lastScanCompletedTime = 0;
-    UInt32 orig_rcr = read32(0x0608);
-
-    // Set promiscuous: accept AP, AM, APM, AB, AAP
-    // CRITICAL: do NOT call setChannelHw() to restore at end of scan —
-    // the wrong 3-wire control register sequence (0x1c90 bit 8) breaks the
-    // RF receiver after the restore call, making subsequent scans deaf.
-    // The ISR (handleInterrupt) now handles all beacon parsing; we just
-    // need to stay promiscuous for the sweep duration.
-    write32(0x0608, (orig_rcr | 0x0F) & ~((1U << 6) | (1U << 7)));
-    OSSynchronizeIO();
-
-    RTW_DEBUG_LOG("RealtekRTL8822C: Starting channel sweep...\n");
-    static const UInt8 scanChannels[] = {
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-        36, 40, 44, 48, 149, 153, 157, 161, 165
-    };
-    bool scanOk = true;
-    for (UInt32 index = 0; index < sizeof(scanChannels); index++) {
-        UInt32 chan = scanChannels[index];
-        scanChannel = chan;
-        UInt32 channelFlags = chan > 14 ? APPLE80211_C_FLAG_5GHZ : APPLE80211_C_FLAG_2GHZ;
-        if (!setChannelHw(chan, channelFlags | APPLE80211_C_FLAG_20MHZ,
-                          0, 0, true)) {
-            scanOk = false;
-            break;
-        }
-        // setProperties() is serialized through the controller command gate.
-        // While this scan holds that gate the interrupt event source cannot
-        // run on the same work loop, so drain the RX ring synchronously after
-        // every dwell. Advancing rxRp prevents the deferred ISR from parsing
-        // these frames a second time after the command returns.
-        IOSleep(250);
-        processRxPacketsForScan();
-    }
-    processRxPacketsForScan();
-
-    // Restore only RCR (promiscuous -> normal filter).
-    // We intentionally leave the RF on the last swept channel to avoid
-    // corrupting the RF state with a restore call. The next connect/scan will
-    // set the channel correctly via setChannelHw().
-    write32(0x0608, orig_rcr);
-    OSSynchronizeIO();
-
-    publishScanResults();
-    if (scanOk) clock_get_uptime(&lastScanCompletedTime);
-    return scanOk;
-}
-
 void RealtekRTL8822C::publishScanResults() {
     if (customScanResultsCount == 0) {
         setProperty("ScanResults", "No networks found.");
+        scanResultsGeneration++;
+        setProperty("ScanGeneration", (uint64_t)scanResultsGeneration, 32);
         return;
     }
 
@@ -9059,7 +9527,7 @@ void RealtekRTL8822C::publishScanResults() {
         const char* security = customScanResults[i].security_mode == SECURITY_WPA2 ? "WPA2" :
                                (customScanResults[i].security_mode == SECURITY_WPA ? "WPA" : "Open");
         snprintf(entry, sizeof(entry), "\n  - %s (%s, ch=%d) [Signal: %s, BSSID: %02x:%02x:%02x:%02x:%02x:%02x]",
-                 customScanResults[i].ssid,
+                 customScanResults[i].hidden ? "<Hidden>" : customScanResults[i].ssid,
                  security,
                  customScanResults[i].channel,
                  signalText,
@@ -9069,6 +9537,8 @@ void RealtekRTL8822C::publishScanResults() {
     }
 
     setProperty("ScanResults", buf);
+    scanResultsGeneration++;
+    setProperty("ScanGeneration", (uint64_t)scanResultsGeneration, 32);
 }
 
 void RealtekRTL8822C::pruneScanResults(uint64_t maxAgeNs) {
@@ -9089,49 +9559,6 @@ void RealtekRTL8822C::pruneScanResults(uint64_t maxAgeNs) {
         kept++;
     }
     customScanResultsCount = kept;
-}
-
-void RealtekRTL8822C::processRxPacketsForScan() {
-    UInt32 tmp = read32(0x03B4);
-    UInt32 hw_wp = (tmp >> 16) & 0x0FFF;
-    UInt32 rp = rxRp;
-
-    int processed = 0;
-    while (rp != hw_wp && processed < 512) {
-        rxBufferDmaCmd->synchronize(kIODirectionIn);
-        UInt8* rx_buf = rxBufferVirtAddr + rp * 12288;
-
-        UInt32 w0 = OSReadLittleInt32(rx_buf, 0);
-        UInt32 w2 = OSReadLittleInt32(rx_buf, 8);
-
-        UInt32 pkt_len = w0 & 0x3FFF;
-        UInt32 crc_err = (w0 >> 14) & 1;
-        UInt32 drv_info_sz = ((w0 >> 16) & 0x0F) * 8;
-        UInt32 shift = (w0 >> 24) & 0x03;
-        UInt32 is_c2h = (w2 >> 28) & 1;
-
-        UInt32 pkt_offset = 24 + drv_info_sz + shift;
-
-        if (pkt_len > 0 && !crc_err && !is_c2h) {
-            UInt8* wifi_frame = rx_buf + pkt_offset;
-            UInt32 wifi_len = pkt_len;
-            if (wifi_len > 4) wifi_len -= 4; // Strip FCS
-
-            int signalDbm = -127;
-            if ((w0 & (1U << 26)) && drv_info_sz != 0)
-                signalDbm = extractRxSignalDbm(rx_buf + 24 + shift, drv_info_sz);
-            parseBeaconOrProbeResponse(wifi_frame, wifi_len, signalDbm);
-        }
-
-        rp = (rp + 1) % 512;
-        processed++;
-    }
-
-    if (processed > 0) {
-        rxRp = rp;
-        write16(0x03B4, (UInt16)rp);
-        OSSynchronizeIO();
-    }
 }
 
 int RealtekRTL8822C::extractRxSignalDbm(const UInt8* phyStatus, UInt32 phyStatusLen) {
@@ -9299,9 +9726,8 @@ void RealtekRTL8822C::parseBeaconOrProbeResponse(const UInt8* frame, UInt32 len,
     if (channel == 0)
         channel = ht_primary_channel != 0 ? ht_primary_channel : (int)scanChannel;
 
-    if (ssid[0] == '\0') {
-        strlcpy(ssid, "<Hidden>", sizeof(ssid));
-    }
+    UInt8 parsedSsidLength = static_cast<UInt8>(strnlen(ssid, 32));
+    bool hidden = parsedSsidLength == 0;
 
     for (int i = 0; i < customScanResultsCount; i++) {
         bool match = true;
@@ -9313,9 +9739,12 @@ void RealtekRTL8822C::parseBeaconOrProbeResponse(const UInt8* frame, UInt32 len,
         }
         if (match) {
             clock_get_uptime(&customScanResults[i].last_seen_time);
-            if (ssid[0] != '\0' && strcmp(ssid, "<Hidden>") != 0)
+            if (!hidden) {
                 strlcpy(customScanResults[i].ssid, ssid,
                         sizeof(customScanResults[i].ssid));
+                customScanResults[i].ssidLength = parsedSsidLength;
+                customScanResults[i].hidden = false;
+            }
             customScanResults[i].channel = channel;
             if (signalDbm >= -120 && signalDbm <= 0) {
                 int oldSignal = customScanResults[i].rssi;
@@ -9367,7 +9796,10 @@ void RealtekRTL8822C::parseBeaconOrProbeResponse(const UInt8* frame, UInt32 len,
 
     if (resultIndex >= 0 && resultIndex < 32) {
         RTL8822CScanResult& res = customScanResults[resultIndex];
-        strlcpy(res.ssid, ssid, sizeof(res.ssid));
+        memset(res.ssid, 0, sizeof(res.ssid));
+        if (!hidden) strlcpy(res.ssid, ssid, sizeof(res.ssid));
+        res.ssidLength = parsedSsidLength;
+        res.hidden = hidden;
         memcpy(res.bssid, bssid, 6);
         res.channel = channel;
         res.is_secure = is_secure;
@@ -9397,7 +9829,8 @@ void RealtekRTL8822C::parseBeaconOrProbeResponse(const UInt8* frame, UInt32 len,
 
         char parseDb[256];
         snprintf(parseDb, sizeof(parseDb), "added: SSID='%s' BSSID=%02x:%02x:%02x:%02x:%02x:%02x ch=%d signal=%d secure=%d ht=%d vht=%d wmm=%d cap=%04x ampdu=%02x mcs=%02x/%02x op=%02x vhtmap=%04x/%04x vhtop=%u/%u/%u count=%d",
-                 ssid, bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], channel,
+                 hidden ? "<Hidden>" : ssid,
+                 bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], channel,
                  res.rssi, is_secure,
                  supports_ht ? 1 : 0, supports_vht ? 1 : 0, supports_wmm ? 1 : 0,
                  ht_cap_info, ht_ampdu_params, ht_mcs0, ht_mcs1, ht_operation_info,
@@ -9491,7 +9924,10 @@ void RealtekRTL8822C::handleMgmtFrame(const UInt8* frame, UInt32 len) {
                  subtype == 12 ? "deauth" : "disassoc", reason);
         RTW_DEBUG_PROPERTY("Debug_Peer_Disconnect", peerLeave);
         traceEvent(subtype == 12 ? "link:peer-deauth" : "link:peer-disassoc");
-        disconnectFromNetwork(subtype == 12 ? "peer-deauth" : "peer-disassoc", false);
+        const char* disconnectReason = fourWayInProgress && reason == 15 ?
+            "wpa-handshake-rejected" :
+            (subtype == 12 ? "peer-deauth" : "peer-disassoc");
+        disconnectFromNetwork(disconnectReason, false);
         if (fourWayInProgress && reason == 15) {
             setProperty("WiFiStatus", "WPAHandshakeRejected");
             setProperty("DriverStatus", "AP ended the WPA2 four-way handshake (reason 15); verify the password and retry connect");
@@ -9582,6 +10018,12 @@ void RealtekRTL8822C::handleMgmtFrame(const UInt8* frame, UInt32 len) {
     }
 
     if (subtype == 11 && connState == CONN_STATE_CONNECTING_AUTH) {
+        if (!connectionAttemptActive ||
+            authPhaseAttemptId != connectionAttemptGeneration) {
+            staleAttemptDrops++;
+            traceEvent("auth:stale-attempt-response-drop");
+            return;
+        }
         if (len < 30) return;
         UInt16 seq = (UInt16)((UInt16)frame[26] | ((UInt16)frame[27] << 8));
         UInt16 status = (UInt16)((UInt16)frame[28] | ((UInt16)frame[29] << 8));
@@ -9599,6 +10041,12 @@ void RealtekRTL8822C::handleMgmtFrame(const UInt8* frame, UInt32 len) {
             setProperty("WiFiStatus", "AuthFailed");
         }
     } else if (subtype == 1 && connState == CONN_STATE_CONNECTING_ASSOC) {
+        if (!connectionAttemptActive ||
+            assocPhaseAttemptId != connectionAttemptGeneration) {
+            staleAttemptDrops++;
+            traceEvent("assoc:stale-attempt-response-drop");
+            return;
+        }
         if (len < 30) return;
         UInt16 status = (UInt16)((UInt16)frame[26] | ((UInt16)frame[27] << 8));
 
@@ -9819,6 +10267,7 @@ void RealtekRTL8822C::handleMgmtFrame(const UInt8* frame, UInt32 len) {
             portAuthorized = targetSecurityMode == SECURITY_OPEN;
             if (targetSecurityMode == SECURITY_WPA2) {
                 wpaState = WPA_STATE_WAIT_M1;
+                wpaPhaseAttemptId = connectionAttemptGeneration;
                 wpaRetries = 0;
                 clock_get_uptime(&wpaStateStartTime);
             }
@@ -9837,8 +10286,12 @@ void RealtekRTL8822C::handleMgmtFrame(const UInt8* frame, UInt32 len) {
                 publishWpaState("association-complete");
             if (portAuthorized)
                 activateNetworkDataPath("open-association-complete");
-            else
+            else {
+                if (connectionAttemptActive)
+                    publishConnectionAttempt("negotiating-wpa", "pending",
+                                             "none");
                 setLinkStatus(kIONetworkLinkValid);
+            }
             RTW_DEBUG_LOG("RealtekRTL8822C: Association Success! %s %s\n",
                   portAuthorized ? "Connected to" : "Starting WPA handshake with", targetSsid);
             if (htNegotiated && portAuthorized) {
@@ -9858,7 +10311,13 @@ void RealtekRTL8822C::handleMgmtFrame(const UInt8* frame, UInt32 len) {
 void RealtekRTL8822C::disconnectFromNetwork(const char* reason, bool sendDeauth) {
     if (scanInProgress)
         finishConnectedScan(true, reason ? reason : "disconnect", true);
+    RTL8822CConnState previousConnectionState = connState;
     bool wasConnected = connState == CONN_STATE_CONNECTED;
+    bool wasAuthorized = wasConnected && portAuthorized;
+    char disconnectedSsid[sizeof(targetSsid)];
+    memset(disconnectedSsid, 0, sizeof(disconnectedSsid));
+    if (wasAuthorized)
+        strlcpy(disconnectedSsid, targetSsid, sizeof(disconnectedSsid));
     traceEvent(reason && strcmp(reason, "reconnect") == 0 ? "disconnect:reconnect" : "disconnect:user");
 
     IOOutputQueue* queue = getOutputQueue();
@@ -9990,6 +10449,47 @@ void RealtekRTL8822C::disconnectFromNetwork(const char* reason, bool sendDeauth)
              (unsigned int)read32(0x03b0), (unsigned int)read32(0x03a8),
              (unsigned int)read32(0x0608));
     RTW_DEBUG_PROPERTY("Debug_Connection_Lifecycle", lifecycle);
+    if (wasAuthorized) {
+        bool local = reason &&
+            (strcmp(reason, "user") == 0 ||
+             strcmp(reason, "reconnect") == 0 ||
+             strcmp(reason, "interface-disabled") == 0 ||
+             strcmp(reason, "system-sleep") == 0 ||
+             strcmp(reason, "connection-cancelled") == 0);
+        publishLinkEvent(local ? "local-disconnect" : "disconnected",
+                         disconnectedSsid, reason);
+    } else if (connectionAttemptActive) {
+        bool cancelled = reason &&
+            (strcmp(reason, "user") == 0 ||
+             strcmp(reason, "connection-cancelled") == 0 ||
+             strcmp(reason, "interface-disabled") == 0 ||
+             strcmp(reason, "system-sleep") == 0);
+        const char* failureCode = "internal-error";
+        if (cancelled) failureCode = "cancelled";
+        else if (reason && strcmp(reason, "timeout") == 0)
+            failureCode = previousConnectionState == CONN_STATE_CONNECTING_AUTH ?
+                "auth-timeout" : "assoc-timeout";
+        else if (reason && strcmp(reason, "wpa-timeout") == 0)
+            failureCode = "wpa-timeout";
+        else if (reason && strcmp(reason, "auth-rejected") == 0)
+            failureCode = "auth-rejected";
+        else if (reason && strcmp(reason, "assoc-rejected") == 0)
+            failureCode = "assoc-rejected";
+        else if (reason && strcmp(reason, "wpa-handshake-rejected") == 0)
+            failureCode = "invalid-credentials";
+        else if (reason && (strcmp(reason, "peer-deauth") == 0 ||
+                            strcmp(reason, "peer-disassoc") == 0))
+            failureCode = "ap-disconnected";
+        else if (reason && strcmp(reason, "assoc-bandwidth-mismatch") == 0)
+            failureCode = "bandwidth-mismatch";
+        else if (reason && strcmp(reason, "firmware-link-state-failed") == 0)
+            failureCode = "firmware-link-failed";
+        else if (reason && strcmp(reason, "wpa-cam-install-failed") == 0)
+            failureCode = "key-install-failed";
+        publishConnectionAttempt("terminal",
+                                 cancelled ? "cancelled" : "failure",
+                                 failureCode);
+    }
 }
 
 bool RealtekRTL8822C::sendMediaStatus(UInt8 mac_id, bool connect) {
@@ -10079,7 +10579,10 @@ bool RealtekRTL8822C::sendAuthRequest() {
     write32Mask(0x0100, 0x30000, 0);
 
     connState = CONN_STATE_CONNECTING_AUTH;
+    authPhaseAttemptId = connectionAttemptGeneration;
     bool queued = transmitWifiFrame(frame, 30, 18); // Use QSEL=18 (MGMTQ)
+    if (queued && connectionAttemptActive)
+        publishConnectionAttempt("authenticating", "pending", "none");
     traceEvent(queued ? "auth:tx-queued" : "auth:tx-queue-failed");
     return queued;
 }
@@ -10284,7 +10787,10 @@ bool RealtekRTL8822C::sendAssocRequest() {
           targetBssid[0], targetBssid[1], targetBssid[2], targetBssid[3], targetBssid[4], targetBssid[5]);
 
     connState = CONN_STATE_CONNECTING_ASSOC;
+    assocPhaseAttemptId = connectionAttemptGeneration;
     bool queued = transmitWifiFrame(frame, offset, 18); // Use QSEL=18 (MGMTQ)
+    if (queued && connectionAttemptActive)
+        publishConnectionAttempt("associating", "pending", "none");
     traceEvent(queued ? "assoc:tx-queued" : "assoc:tx-queue-failed");
     return queued;
 }

@@ -17,6 +17,8 @@ int32_t RTWClientCopyProperty(const char* key, char* output,
                               size_t outputCapacity);
 int32_t RTWClientCopyReport(char* output, size_t outputCapacity,
                             uint32_t includeDebug);
+int32_t RTWClientCopyScanSnapshotJSON(char* output, size_t outputCapacity);
+uint32_t RTWClientGetAvailability(void);
 
 #ifdef __cplusplus
 }

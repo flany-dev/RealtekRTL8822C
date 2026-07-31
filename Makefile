@@ -4,13 +4,21 @@ PROJECT := RealtekRTL8822C
 VERSION := $(strip $(shell cat VERSION))
 CONFIG ?= Debug
 ARCH ?= x86_64
-MACOS_MIN ?= 15.5
+DEBUG_DRIVER_MACOS_MIN ?= 12.0
+RELEASE_DRIVER_MACOS_MIN ?= 15.5
+USERSPACE_MACOS_MIN ?= 12.0
 SDK_PATH ?= $(shell xcrun --sdk macosx --show-sdk-path)
 MAC_KERNEL_SDK ?= ../MacKernelSDK
 LINUX_RTW88 ?= ../rtw88
 
 ifeq ($(filter $(CONFIG),Debug Release),)
 $(error CONFIG must be Debug or Release)
+endif
+
+ifeq ($(CONFIG),Debug)
+DRIVER_MACOS_MIN ?= $(DEBUG_DRIVER_MACOS_MIN)
+else
+DRIVER_MACOS_MIN ?= $(RELEASE_DRIVER_MACOS_MIN)
 endif
 
 BUILD_ROOT := build/$(CONFIG)
@@ -46,7 +54,7 @@ KERNEL_INCLUDES := -I$(GENERATED_DIR) -Iinclude -Ifirmware \
 	-isystem $(MAC_KERNEL_SDK)/Headers \
 	-isystem $(MAC_KERNEL_SDK)/Headers/Kernel \
 	-isystem $(MAC_KERNEL_SDK)/Headers/Kernel/i386
-KERNEL_COMMON := -target $(ARCH)-apple-macos$(MACOS_MIN) -mkernel -fno-builtin \
+KERNEL_COMMON := -target $(ARCH)-apple-macos$(DRIVER_MACOS_MIN) -mkernel -fno-builtin \
 	-ffreestanding -Wall -Wextra -Wpedantic -Werror -Wno-extra-semi \
 	-Wno-zero-length-array -MMD -MP $(KERNEL_DEFINES) \
 	$(KERNEL_INCLUDES) -isysroot $(SDK_PATH)
@@ -65,16 +73,18 @@ APP_PROFILE_FLAGS := -O
 APP_BRIDGE_DEFINES := -DRTW_APP_DEBUG=0
 endif
 
-CXXFLAGS := $(CXX_COMMON) $(KERNEL_PROFILE_FLAGS) -DRTW_VERSION=\"$(VERSION)\"
-CFLAGS := $(C_COMMON) $(KERNEL_PROFILE_FLAGS) -DRTW_VERSION=\"$(VERSION)\"
-LDFLAGS := -target $(ARCH)-apple-macos$(MACOS_MIN) -Xlinker -kext -nostdlib \
+CXXFLAGS := $(CXX_COMMON) $(KERNEL_PROFILE_FLAGS) -DRTW_VERSION=\"$(VERSION)\" \
+	-DRTW_DRIVER_BUILD_TARGET=\"macOS-$(DRIVER_MACOS_MIN)\"
+CFLAGS := $(C_COMMON) $(KERNEL_PROFILE_FLAGS) -DRTW_VERSION=\"$(VERSION)\" \
+	-DRTW_DRIVER_BUILD_TARGET=\"macOS-$(DRIVER_MACOS_MIN)\"
+LDFLAGS := -target $(ARCH)-apple-macos$(DRIVER_MACOS_MIN) -Xlinker -kext -nostdlib \
 	-lkmodc++ -lkmod -lcc_kext -isysroot $(SDK_PATH)
 
 DRIVER_OBJECTS := $(OBJ_DIR)/RealtekRTL8822C.o $(OBJ_DIR)/RtwWpaCrypto.o \
 	$(OBJ_DIR)/RealtekRTL8822C_info.o
 DEPENDENCIES := $(DRIVER_OBJECTS:.o=.d)
 
-.PHONY: all debug release tools app symbols check privacy-check format-check dma-cache-policy-check release-surface-check profile-check tables-check \
+.PHONY: all debug release tools app symbols check privacy-check format-check dma-cache-policy-check compatibility-check release-surface-check profile-check tables-check \
 	test host-sanitizers reproducibility-check release-check package package-local \
 	package-internal package-kexts package-app verify-publication clean distclean verify-env
 
@@ -96,15 +106,15 @@ $(FIRMWARE_HEADER): $(FIRMWARE) scripts/embed_firmware.py
 	@mkdir -p $(GENERATED_DIR)
 	$(PYTHON) scripts/embed_firmware.py $(FIRMWARE) $@ --sha256 $(FIRMWARE_SHA256)
 
-$(OBJ_DIR)/RealtekRTL8822C.o: src/RealtekRTL8822C.cpp $(FIRMWARE_HEADER)
+$(OBJ_DIR)/RealtekRTL8822C.o: src/RealtekRTL8822C.cpp $(FIRMWARE_HEADER) Makefile
 	@mkdir -p $(OBJ_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(OBJ_DIR)/RtwWpaCrypto.o: src/RtwWpaCrypto.cpp include/RtwWpaCrypto.hpp
+$(OBJ_DIR)/RtwWpaCrypto.o: src/RtwWpaCrypto.cpp include/RtwWpaCrypto.hpp Makefile
 	@mkdir -p $(OBJ_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(OBJ_DIR)/RealtekRTL8822C_info.o: src/RealtekRTL8822C_info.c
+$(OBJ_DIR)/RealtekRTL8822C_info.o: src/RealtekRTL8822C_info.c Makefile
 	@mkdir -p $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -126,30 +136,31 @@ tools: $(RTL8822CCTL)
 app: $(APP_BINARY)
 
 $(RTL8822CCTL): tools/rtl8822cctl/main.cpp $(APP_BRIDGE_OBJECT) \
-		app/bridge/RTL8822CClient.h include/RTL8822CUserClientShared.h VERSION
+		app/bridge/RTL8822CClient.h include/RTL8822CUserClientShared.h VERSION Makefile
 	@mkdir -p $(BUILD_ROOT)
-	$(CXX) -target $(ARCH)-apple-macos$(MACOS_MIN) -arch $(ARCH) \
+	$(CXX) -target $(ARCH)-apple-macos$(USERSPACE_MACOS_MIN) -arch $(ARCH) \
 		-isysroot $(SDK_PATH) -std=c++14 -Wall -Wextra -Wpedantic -Werror $(TOOL_PROFILE_FLAGS) \
 		-Iinclude -Iapp/bridge -DRTW_VERSION=\"$(VERSION)\" $< \
 		$(APP_BRIDGE_OBJECT) \
 		-framework CoreFoundation -framework IOKit -o $@
 
 $(APP_BRIDGE_OBJECT): app/bridge/RTL8822CClient.c \
-		app/bridge/RTL8822CClient.h include/RTL8822CUserClientShared.h
+		app/bridge/RTL8822CClient.h include/RTL8822CUserClientShared.h Makefile
 	@mkdir -p $(OBJ_DIR)
-	$(CC) -target $(ARCH)-apple-macos$(MACOS_MIN) -arch $(ARCH) \
+	$(CC) -target $(ARCH)-apple-macos$(USERSPACE_MACOS_MIN) -arch $(ARCH) \
 		-isysroot $(SDK_PATH) -Iinclude -Iapp/bridge \
 		$(APP_BRIDGE_DEFINES) -Wall -Wextra -Wpedantic -Werror -c $< -o $@
 
 $(APP_BINARY): app/RealtekRTL8822CMenu.swift app/Info.plist $(APP_ICON) \
-		$(APP_BRIDGE_OBJECT) VERSION
+		$(APP_BRIDGE_OBJECT) VERSION Makefile
 	@mkdir -p $(APP_BIN_DIR) $(APP_RESOURCES_DIR)
 	sed 's/@VERSION@/$(VERSION)/g' app/Info.plist > $(APP_CONTENTS)/Info.plist
 	cp $(APP_ICON) $(APP_RESOURCES_DIR)/AppIcon.icns
-	xcrun swiftc -parse-as-library -target $(ARCH)-apple-macos$(MACOS_MIN) -sdk $(SDK_PATH) \
+	xcrun swiftc -parse-as-library -target $(ARCH)-apple-macos$(USERSPACE_MACOS_MIN) -sdk $(SDK_PATH) \
 		$(APP_PROFILE_FLAGS) $< $(APP_BRIDGE_OBJECT) \
 		-framework AppKit -framework Foundation -framework Security \
 		-framework ServiceManagement \
+		-framework UserNotifications \
 		-framework CoreFoundation -framework IOKit -o $@
 	chmod -R 755 $(APP_DIR)
 	codesign --force --sign - --timestamp=none $(APP_DIR)
@@ -172,6 +183,9 @@ format-check:
 dma-cache-policy-check:
 	sh scripts/check_dma_cache_policy.sh
 
+compatibility-check: debug
+	sh scripts/check_compatibility_surface.sh
+
 release-surface-check:
 	sh scripts/check_release_surface.sh
 
@@ -185,7 +199,7 @@ tables-check:
 		build/Verification/rtw8822c_tables.h
 	cmp firmware/rtw8822c_tables.h build/Verification/rtw8822c_tables.h
 
-test: debug release privacy-check format-check dma-cache-policy-check
+test: debug release privacy-check format-check dma-cache-policy-check compatibility-check
 	plutil -lint build/Debug/$(PROJECT).kext/Contents/Info.plist
 	plutil -lint build/Release/$(PROJECT).kext/Contents/Info.plist
 	@test "`/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' build/Debug/$(PROJECT).kext/Contents/Info.plist`" = "$(VERSION)"
@@ -223,6 +237,12 @@ test: debug release privacy-check format-check dma-cache-policy-check
 	$(CXX) -std=c++14 -Wall -Wextra -Wpedantic -Werror -Iinclude \
 		tests/user_client_model.cpp -o build/Tests/user_client_model
 	build/Tests/user_client_model
+	$(CXX) -std=c++14 -Wall -Wextra -Wpedantic -Werror \
+		tests/scan_bss_model.cpp -o build/Tests/scan_bss_model
+	build/Tests/scan_bss_model
+	$(CXX) -std=c++14 -Wall -Wextra -Wpedantic -Werror \
+		tests/probe_request_model.cpp -o build/Tests/probe_request_model
+	build/Tests/probe_request_model
 	$(CXX) -std=c++14 -Wall -Wextra -Wpedantic -Werror -DRTW_WPA_USERSPACE \
 		-Iinclude src/RtwWpaCrypto.cpp tests/wpa_crypto_test.cpp \
 		-o build/Tests/wpa_crypto

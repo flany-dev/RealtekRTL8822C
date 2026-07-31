@@ -88,10 +88,13 @@ static bool readStringProperty(io_service_t service, CFStringRef key,
 static void printUsage(std::ostream& out) {
     out << "Usage:\n"
         << "  rtl8822cctl version             Display the command-line tool version\n"
+        << "  rtl8822cctl availability        Distinguish driver, compatible PCI hardware, or unsupported hardware\n"
         << "  rtl8822cctl status              Display driver and card status\n"
         << "  rtl8822cctl report              Display the complete diagnostic report\n"
         << "  rtl8822cctl scan                Trigger a wireless scan\n"
+        << "  rtl8822cctl bss                 Display the structured BSS snapshot as JSON\n"
         << "  rtl8822cctl connect <SSID> [pw|--ask-password] Connect; prompts when password is omitted\n"
+        << "  rtl8822cctl cancel-connect      Cancel a pending connection attempt\n"
         << "  rtl8822cctl disconnect          Disconnect from the current network\n"
         << "  rtl8822cctl on                  Enable the driver Wi-Fi interface\n"
         << "  rtl8822cctl off                 Disable the driver Wi-Fi interface\n";
@@ -107,8 +110,15 @@ int main(int argc, char* argv[]) {
         printUsage(std::cout);
         return 0;
     }
-    if (cmd != "status" && cmd != "report" && cmd != "scan" &&
-        cmd != "connect" && cmd != "disconnect" &&
+    if (cmd == "availability") {
+        switch (RTWClientGetAvailability()) {
+            case 2: std::cout << "Driver loaded; RTL8822CE is ready.\n"; return 0;
+            case 1: std::cout << "Compatible RTL8822CE 10ec:c822 detected; kext is not loaded or failed to start.\n"; return 1;
+            default: std::cout << "Supported RTL8822CE 10ec:c822 hardware was not detected.\n"; return 2;
+        }
+    }
+    if (cmd != "status" && cmd != "report" && cmd != "scan" && cmd != "bss" &&
+        cmd != "connect" && cmd != "cancel-connect" && cmd != "disconnect" &&
         cmd != "on" && cmd != "off") {
         std::cerr << "Unknown command: " << cmd << "\n";
         printUsage(std::cerr);
@@ -128,7 +138,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (cmd == "status" || cmd == "report") {
+    if (cmd == "bss") {
+        char snapshot[64 * 1024];
+        kern_return_t kr = RTWClientCopyScanSnapshotJSON(snapshot, sizeof(snapshot));
+        if (kr != kIOReturnSuccess) {
+            std::cerr << "Failed to read the structured BSS snapshot. Error: 0x"
+                      << std::hex << kr << std::dec << "\n";
+            IOObjectRelease(service);
+            return 2;
+        }
+        std::cout << snapshot << "\n";
+    } else if (cmd == "status" || cmd == "report") {
         // Send UpdateStatus command to driver first to refresh register values
         RTWClientSendCommand(kRTL8822CUserCommandUpdateStatus, "", "", 0);
         CFMutableDictionaryRef properties = nullptr;
@@ -289,32 +309,30 @@ int main(int argc, char* argv[]) {
 
         if (kr == kIOReturnSuccess) {
             std::string state;
-            bool asynchronous = readStringProperty(
-                service, CFSTR("ConnectedScanState"), state) &&
-                state.find("active=1") != std::string::npos;
-            if (asynchronous) {
-                std::cout << "Connected scan started; waiting for channel restoration...\n";
-                bool completed = false;
-                for (int i = 0; i < 150; i++) {
-                    usleep(100000);
-                    if (readStringProperty(service, CFSTR("ConnectedScanState"), state) &&
+            bool observedActive = false;
+            bool completed = false;
+            std::cout << "Scan started; waiting for completion...\n";
+            for (int i = 0; i < 150; i++) {
+                if (readStringProperty(service, CFSTR("ScanState"), state)) {
+                    if (state.find("active=1") != std::string::npos)
+                        observedActive = true;
+                    if (observedActive &&
                         state.find("active=0") != std::string::npos) {
                         completed = state.find("result=complete") != std::string::npos;
                         break;
                     }
                 }
-                if (!completed) {
-                    std::cerr << "Connected scan did not complete cleanly: " << state << "\n";
-                    IOObjectRelease(service);
-                    return 1;
-                }
-                std::string results;
-                std::cout << "Connected scan complete: " << state << "\n";
-                if (readStringProperty(service, CFSTR("ScanResults"), results))
-                    std::cout << "ScanResults:" << results << "\n";
-            } else {
-                std::cout << "Scan command successfully completed.\n";
+                usleep(100000);
             }
+            if (!completed) {
+                std::cerr << "Scan did not complete cleanly: " << state << "\n";
+                IOObjectRelease(service);
+                return 1;
+            }
+            std::string results;
+            std::cout << "Scan complete: " << state << "\n";
+            if (readStringProperty(service, CFSTR("ScanResults"), results))
+                std::cout << "ScanResults:" << results << "\n";
         } else {
             std::cerr << "Failed to send Scan command. Error: 0x" << std::hex
                       << kr << std::dec << ". The v0.0.2 or newer driver is required.\n";
@@ -368,6 +386,17 @@ int main(int argc, char* argv[]) {
         } else {
             std::cerr << "Failed to send Connect command. Error: 0x" << std::hex << kr << std::dec
                       << ". Check 'rtl8822cctl report' for WiFiStatus and DriverStatus.\n";
+            IOObjectRelease(service);
+            return 2;
+        }
+    } else if (cmd == "cancel-connect") {
+        kern_return_t kr = RTWClientSendCommand(
+            kRTL8822CUserCommandCancelConnection, "", "", 0);
+        if (kr == kIOReturnSuccess) {
+            std::cout << "Pending connection cancellation requested.\n";
+        } else {
+            std::cerr << "Failed to cancel connection. Error: 0x" << std::hex
+                      << kr << std::dec << "\n";
             IOObjectRelease(service);
             return 2;
         }

@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.0.4 - 2026-08-17
+
+### Hardware compatibility
+
+- Added silicon-derived cut and 1T1R/2T2R handling across RF initialization,
+  calibration, power validation, firmware configuration, and HT/VHT capability
+  advertisement instead of assuming the reference 2T2R cut-D board.
+- Ported Linux RTL8822C PCI handling for cut D+, REFCLK delay, RFE 5, and RFE 6
+  sleep/wake, with a bounded PCI capability-list traversal.
+- Added a local, table-driven PCI PHY compatibility boundary for gen1/gen2:
+  negotiated PCIe generation/width and cut selection are recorded, while
+  optional DBI/MDIO parameter failures are non-fatal compatibility warnings.
+  The current RTL8822C parameter tables remain sentinel-only, matching the
+  upstream chip data rather than inventing board-specific writes.
+- Raised the exact RTL8822CE personality probe score and removed the redundant
+  name match so another PCI personality cannot win binding solely because of
+  ACPI topology or an alternate provider name.
+- Stopped forcing PCIe Relaxed Ordering and No Snoop, and restore the original
+  PCIe control state after partial start or stop.
+- Reject unsupported or erased RFE options before the transmit path is enabled.
+
+### Self-diagnostics and compatibility UI
+
+- Added staged startup results persisted on the PCI provider so failed
+  initialization remains distinguishable from an unloaded kext.
+- Added bounded Release PCI/chip/RFE evidence and deeper Debug-only stage,
+  PCI, chip, EFUSE, and CLKREQ snapshots with no packet-path publication.
+- Removed all reliance on `IOLog` in both profiles.
+- Updated the CLI and menu application to report initialization failures and
+  read a compatibility report without a live controller service. A separate
+  **Fail Info…** window exposes deep startup evidence only when the failed kext
+  identifies itself as Debug.
+- The single menu application now detects a running Debug kext from the
+  controller's `BuildConfiguration`, falls back to the PCI provider identity,
+  and merges provider startup evidence into **Debug Info…**.
+- Added host models and binary checks for topology, RFE eligibility, failed
+  startup state, Debug/Release separation, and macOS deployment targets.
+
+### Release scope
+
+- Retained experimental macOS 12 targets for Debug kext and userspace while
+  keeping Release at macOS 15.5. macOS 14 secondary-hardware evidence remains
+  required before backward-compatibility claims are promoted.
+- Deferred DFS transmit support to a later independent milestone.
+
 ## 0.0.3 - 2026-07-31
 
 ### Scan and network discovery

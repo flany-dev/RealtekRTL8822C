@@ -1,7 +1,7 @@
 # RealtekRTL8822C
 
 RealtekRTL8822C is an x86_64 macOS PCIe driver for the Realtek RTL8822CE
-(`10ec:c822`). Version `0.0.3` is the current release.
+(`10ec:c822`). Version `0.0.4` is the current release.
 
 The driver is implemented as an `IOEthernetController` with a native menu bar
 application, `RealtekRTL8822CMenu`, and the companion command-line utility
@@ -32,11 +32,12 @@ Hardware-confirmed functionality includes:
   credential recovery, and native link notifications;
 - separate diagnostic Debug and log-free Release profiles.
 
-The final Release profile has been tested on the reference system through
+The final v0.0.4 Release profile has been tested on the reference system through
 normal traffic, sustained load, reconnect, and sleep/wake without finding a
-driver failure. Sustained bidirectional traffic remained stable in the final
-v0.0.3 run. This remains a single-system matrix, not a claim of compatibility
-with every RTL8822CE laptop or firmware configuration.
+driver failure. This remains a single-system confirmed matrix, not a claim of
+compatibility with every RTL8822CE laptop, macOS version, or firmware
+configuration. A secondary macOS 14 board remains an important compatibility
+target.
 
 ## Channel policy and limitations
 
@@ -75,22 +76,27 @@ make test
 
 Artifacts are written only under `build/`:
 
-- `build/Debug/RealtekRTL8822C.kext`, `build/Debug/rtl8822cctl`, and
-  `build/Debug/RealtekRTL8822CMenu.app`;
+- `build/Debug/RealtekRTL8822C.kext` and `build/Debug/rtl8822cctl`;
 - `build/Release/RealtekRTL8822C.kext`, `build/Release/rtl8822cctl`,
-  `build/Release/RealtekRTL8822CMenu.app`, and
-  `build/Release/RealtekRTL8822C.dSYM`.
+  and `build/Release/RealtekRTL8822C.dSYM`;
+- `build/app/RealtekRTL8822CMenu.app` (the single runtime-profile-aware app).
 
-Debug publishes `Debug_*` IORegistry diagnostics, enables diagnostic kernel
-logging, and adds a **Debug Info** window to the menu app. Release compiles out
-those properties, logging, diagnostic report keys, and the Debug UI. Automated
-binary checks enforce this boundary.
+Debug publishes `Debug_*` operational state plus deep `RTL8822CDebug*` startup
+diagnostics. The single distributed menu app discovers the kext profile at
+runtime: it shows **Debug Info** for a loaded Debug kext and **Fail Info…** for
+a failed Debug start, reading the latter from the PCI provider without a
+controller service. Release retains only a bounded start-time compatibility
+result, so both diagnostic buttons stay hidden for a Release kext. Neither
+profile relies on `IOLog`, and no v0.0.4
+compatibility property is updated from the packet path. Automated binary checks
+enforce this boundary.
 
 The application and CLI use a macOS 12 deployment target. The Debug kext also
-uses an experimental macOS 12 deployment target for compatibility testing, but
-it has only been run on the current macOS 15 reference system and is built with
-newer SDK kmod startup objects. It is not evidence of macOS 12-14 support. The
-Release kext retains the hardware-confirmed macOS 15.5 target.
+uses an experimental macOS 12 deployment target for compatibility testing and
+links the pinned MacKernelSDK startup objects instead of newer SDK 15.5 kmod
+objects. Source and load-command compatibility are checked, but runtime on
+macOS 12-14 still requires hardware evidence. The Release kext retains the
+hardware-confirmed macOS 15.5 target.
 
 Deployment is deliberately outside the build system. Copy the selected kext
 and utility manually to the locations used by your boot configuration. Keep a
@@ -111,14 +117,15 @@ under `build/package/`.
 `make package` creates the complete maintainer archive, two kext-only GitHub
 Release assets, and the menu application asset:
 
-- `build/package/RealtekRTL8822C-0.0.3-Release.zip`;
-- `build/package/RealtekRTL8822C-0.0.3-Debug.zip`;
-- `build/package/RealtekRTL8822CMenu-0.0.3.zip`.
+- `build/package/RealtekRTL8822C-0.0.4-Release.zip`;
+- `build/package/RealtekRTL8822C-0.0.4-Debug.zip`;
+- `build/package/RealtekRTL8822CMenu-0.0.4.zip`.
 
-Each of those two archives contains only `RealtekRTL8822C.kext`. The Release
-asset is intended for ordinary use; Debug is intended for diagnostic reports.
-The application archive contains only `RealtekRTL8822CMenu.app` and is a normal
-v0.0.3 release download alongside the two kext archives.
+The Release driver archive contains only `RealtekRTL8822C.kext`. The Debug
+archive contains the Debug kext and matching Debug `rtl8822cctl`, so a failed
+startup report can be collected without compiling the project. The application
+archive contains only `RealtekRTL8822CMenu.app` and is a normal v0.0.4 release
+download alongside the two driver archives.
 `make package-local` creates the complete locally named test archive. None of
 these commands installs anything.
 
@@ -127,7 +134,12 @@ these commands installs anything.
 Launch `RealtekRTL8822CMenu.app` for menu bar scanning, connection,
 disconnect, and Wi-Fi on/off control. WPA2 credentials are stored in the user
 Keychain. Driver commands use a narrow local-user `IOUserClient` and do not
-require `sudo` with the v0.0.3 kext.
+require `sudo` with the v0.0.4 kext.
+
+If initialization fails, the app and `rtl8822cctl availability` report that
+state separately from an unloaded kext. `rtl8822cctl report` then reads the
+postmortem directly from the surviving `IOPCIDevice`; the Debug build includes
+the deeper startup trace and selected EFUSE/RFE evidence.
 
 Run `rtl8822cctl help` for the command list. Interactive `connect` prompts for a
 password without echoing it or placing it in shell history. See the
@@ -139,7 +151,7 @@ password without echoing it or placing it in shell history. See the
 
 - [Roadmap](ROADMAP.md)
 - [Changelog](CHANGELOG.md)
-- [v0.0.3 release notes](RELEASE_NOTES.md)
+- [v0.0.4 release notes](RELEASE_NOTES.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)

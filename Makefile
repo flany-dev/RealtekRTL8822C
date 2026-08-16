@@ -31,13 +31,14 @@ KEXT_BINARY := $(KEXT_BIN_DIR)/$(PROJECT)
 DSYM_DIR := $(BUILD_ROOT)/$(PROJECT).dSYM
 RTL8822CCTL := $(BUILD_ROOT)/rtl8822cctl
 APP_NAME := RealtekRTL8822CMenu
-APP_DIR := $(BUILD_ROOT)/$(APP_NAME).app
+APP_BUILD_ROOT := build/app
+APP_DIR := $(APP_BUILD_ROOT)/$(APP_NAME).app
 APP_CONTENTS := $(APP_DIR)/Contents
 APP_BIN_DIR := $(APP_CONTENTS)/MacOS
 APP_RESOURCES_DIR := $(APP_CONTENTS)/Resources
 APP_BINARY := $(APP_BIN_DIR)/$(APP_NAME)
 APP_ICON := app/Assets/AppIcon.icns
-APP_BRIDGE_OBJECT := $(OBJ_DIR)/RTL8822CClient.o
+APP_BRIDGE_OBJECT := $(APP_BUILD_ROOT)/obj/RTL8822CClient.o
 FIRMWARE := firmware/rtw8822c_fw.bin
 FIRMWARE_HEADER := $(GENERATED_DIR)/rtw8822c_fw.h
 FIRMWARE_SHA256 := 3deecb31210986d98cdbfb000391e08d602a6eee4ffc883969faa2b907ab03ba
@@ -64,37 +65,41 @@ C_COMMON := $(KERNEL_COMMON) -x c
 ifeq ($(CONFIG),Debug)
 KERNEL_PROFILE_FLAGS := -O0 -g -DRTW_DEBUG=1
 TOOL_PROFILE_FLAGS := -O0 -g -DRTW_DEBUG=1
-APP_PROFILE_FLAGS := -Onone -g -D RTW_APP_DEBUG
-APP_BRIDGE_DEFINES := -DRTW_APP_DEBUG=1
 else
 KERNEL_PROFILE_FLAGS := -O2 -g -DNDEBUG -DRTW_DEBUG=0
 TOOL_PROFILE_FLAGS := -O2 -DNDEBUG -DRTW_DEBUG=0
-APP_PROFILE_FLAGS := -O
-APP_BRIDGE_DEFINES := -DRTW_APP_DEBUG=0
 endif
+APP_PROFILE_FLAGS := -O
 
 CXXFLAGS := $(CXX_COMMON) $(KERNEL_PROFILE_FLAGS) -DRTW_VERSION=\"$(VERSION)\" \
 	-DRTW_DRIVER_BUILD_TARGET=\"macOS-$(DRIVER_MACOS_MIN)\"
 CFLAGS := $(C_COMMON) $(KERNEL_PROFILE_FLAGS) -DRTW_VERSION=\"$(VERSION)\" \
 	-DRTW_DRIVER_BUILD_TARGET=\"macOS-$(DRIVER_MACOS_MIN)\"
 LDFLAGS := -target $(ARCH)-apple-macos$(DRIVER_MACOS_MIN) -Xlinker -kext -nostdlib \
-	-lkmodc++ -lkmod -lcc_kext -isysroot $(SDK_PATH)
+	-L$(MAC_KERNEL_SDK)/Library/universal -lkmodc++ -lkmod -lcc_kext \
+	-isysroot $(SDK_PATH)
 
 DRIVER_OBJECTS := $(OBJ_DIR)/RealtekRTL8822C.o $(OBJ_DIR)/RtwWpaCrypto.o \
 	$(OBJ_DIR)/RealtekRTL8822C_info.o
 DEPENDENCIES := $(DRIVER_OBJECTS:.o=.d)
 
-.PHONY: all debug release tools app symbols check privacy-check format-check dma-cache-policy-check compatibility-check release-surface-check profile-check tables-check \
+.PHONY: all profile debug release tools app symbols check privacy-check format-check dma-cache-policy-check compatibility-check release-surface-check profile-check tables-check \
 	test host-sanitizers reproducibility-check release-check package package-local \
 	package-internal package-kexts package-app verify-publication clean distclean verify-env
 
-all: verify-env $(KEXT_BINARY)
+ifeq ($(origin CONFIG),command line)
+all: profile app
+else
+all: debug release app
+endif
+
+profile: verify-env $(KEXT_BINARY) tools
 
 debug:
-	$(MAKE) CONFIG=Debug all tools app
+	$(MAKE) CONFIG=Debug profile
 
 release:
-	$(MAKE) CONFIG=Release all tools app symbols
+	$(MAKE) CONFIG=Release profile symbols
 
 verify-env:
 	@test -f VERSION || { echo "missing VERSION"; exit 1; }
@@ -106,15 +111,15 @@ $(FIRMWARE_HEADER): $(FIRMWARE) scripts/embed_firmware.py
 	@mkdir -p $(GENERATED_DIR)
 	$(PYTHON) scripts/embed_firmware.py $(FIRMWARE) $@ --sha256 $(FIRMWARE_SHA256)
 
-$(OBJ_DIR)/RealtekRTL8822C.o: src/RealtekRTL8822C.cpp $(FIRMWARE_HEADER) Makefile
+$(OBJ_DIR)/RealtekRTL8822C.o: src/RealtekRTL8822C.cpp $(FIRMWARE_HEADER) VERSION Makefile
 	@mkdir -p $(OBJ_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(OBJ_DIR)/RtwWpaCrypto.o: src/RtwWpaCrypto.cpp include/RtwWpaCrypto.hpp Makefile
+$(OBJ_DIR)/RtwWpaCrypto.o: src/RtwWpaCrypto.cpp include/RtwWpaCrypto.hpp VERSION Makefile
 	@mkdir -p $(OBJ_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(OBJ_DIR)/RealtekRTL8822C_info.o: src/RealtekRTL8822C_info.c Makefile
+$(OBJ_DIR)/RealtekRTL8822C_info.o: src/RealtekRTL8822C_info.c VERSION Makefile
 	@mkdir -p $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -146,10 +151,10 @@ $(RTL8822CCTL): tools/rtl8822cctl/main.cpp $(APP_BRIDGE_OBJECT) \
 
 $(APP_BRIDGE_OBJECT): app/bridge/RTL8822CClient.c \
 		app/bridge/RTL8822CClient.h include/RTL8822CUserClientShared.h Makefile
-	@mkdir -p $(OBJ_DIR)
+	@mkdir -p $(APP_BUILD_ROOT)/obj
 	$(CC) -target $(ARCH)-apple-macos$(USERSPACE_MACOS_MIN) -arch $(ARCH) \
 		-isysroot $(SDK_PATH) -Iinclude -Iapp/bridge \
-		$(APP_BRIDGE_DEFINES) -Wall -Wextra -Wpedantic -Werror -c $< -o $@
+		-Wall -Wextra -Wpedantic -Werror -c $< -o $@
 
 $(APP_BINARY): app/RealtekRTL8822CMenu.swift app/Info.plist $(APP_ICON) \
 		$(APP_BRIDGE_OBJECT) VERSION Makefile
@@ -226,6 +231,9 @@ test: debug release privacy-check format-check dma-cache-policy-check compatibil
 		tests/hotpath_diagnostics_model.cpp -o build/Tests/hotpath_diagnostics_model
 	build/Tests/hotpath_diagnostics_model
 	$(CXX) -std=c++14 -Wall -Wextra -Wpedantic -Werror \
+		tests/start_compatibility_model.cpp -o build/Tests/start_compatibility_model
+	build/Tests/start_compatibility_model
+	$(CXX) -std=c++14 -Wall -Wextra -Wpedantic -Werror \
 		tests/rx_poll_model.cpp -o build/Tests/rx_poll_model
 	build/Tests/rx_poll_model
 	$(CXX) -std=c++14 -Wall -Wextra -Wpedantic -Werror \
@@ -261,6 +269,10 @@ host-sanitizers:
 		tests/protocol_validation_model.cpp -o build/Sanitizers/protocol_validation_model
 	ASAN_OPTIONS=detect_leaks=0 build/Sanitizers/protocol_validation_model
 	$(CXX) -std=c++14 -Wall -Wextra -Wpedantic -Werror \
+		-fsanitize=address,undefined -fno-omit-frame-pointer \
+		tests/start_compatibility_model.cpp -o build/Sanitizers/start_compatibility_model
+	ASAN_OPTIONS=detect_leaks=0 build/Sanitizers/start_compatibility_model
+	$(CXX) -std=c++14 -Wall -Wextra -Wpedantic -Werror \
 		-fsanitize=address,undefined -fno-omit-frame-pointer -DRTW_WPA_USERSPACE \
 		-Iinclude src/RtwWpaCrypto.cpp tests/wpa_crypto_test.cpp \
 		-o build/Sanitizers/wpa_crypto
@@ -293,13 +305,19 @@ package-kexts: debug release
 	$(PYTHON) scripts/create_release_archive.py \
 		build/Release/$(PROJECT).kext \
 		build/package/$(PROJECT)-$(VERSION)-Release.zip
+	@rm -rf build/package/$(PROJECT)-$(VERSION)-Debug
+	@mkdir -p build/package/$(PROJECT)-$(VERSION)-Debug
+	ditto build/Debug/$(PROJECT).kext \
+		build/package/$(PROJECT)-$(VERSION)-Debug/$(PROJECT).kext
+	ditto build/Debug/rtl8822cctl \
+		build/package/$(PROJECT)-$(VERSION)-Debug/rtl8822cctl
 	$(PYTHON) scripts/create_release_archive.py \
-		build/Debug/$(PROJECT).kext \
+		build/package/$(PROJECT)-$(VERSION)-Debug \
 		build/package/$(PROJECT)-$(VERSION)-Debug.zip
 
 package-app: release
 	$(PYTHON) scripts/create_release_archive.py \
-		build/Release/$(APP_NAME).app \
+		build/app/$(APP_NAME).app \
 		build/package/$(APP_NAME)-$(VERSION).zip
 
 package-internal: check symbols
@@ -339,7 +357,7 @@ package-internal: check symbols
 
 clean:
 	rm -rf build/Debug build/Release build/Tests build/Sanitizers \
-		build/Verification build/package
+		build/Verification build/package build/app
 
 distclean: clean
 	rm -rf build

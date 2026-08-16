@@ -113,7 +113,8 @@ int main(int argc, char* argv[]) {
     if (cmd == "availability") {
         switch (RTWClientGetAvailability()) {
             case 2: std::cout << "Driver loaded; RTL8822CE is ready.\n"; return 0;
-            case 1: std::cout << "Compatible RTL8822CE 10ec:c822 detected; kext is not loaded or failed to start.\n"; return 1;
+            case 3: std::cout << "Compatible RTL8822CE 10ec:c822 detected; driver initialization failed. Run 'rtl8822cctl report'.\n"; return 3;
+            case 1: std::cout << "Compatible RTL8822CE 10ec:c822 detected; kext is not loaded.\n"; return 1;
             default: std::cout << "Supported RTL8822CE 10ec:c822 hardware was not detected.\n"; return 2;
         }
     }
@@ -123,6 +124,28 @@ int main(int argc, char* argv[]) {
         std::cerr << "Unknown command: " << cmd << "\n";
         printUsage(std::cerr);
         return 64;
+    }
+
+    // A failed IOService::start() removes the controller service. The bridge
+    // deliberately falls back to the matching PCI provider, where the kext
+    // leaves its bounded startup postmortem properties.
+    if (cmd == "report") {
+        char report[512 * 1024];
+        kern_return_t kr = RTWClientCopyReport(report, sizeof(report),
+#if RTW_DEBUG
+                                               1
+#else
+                                               0
+#endif
+        );
+        if (kr != kIOReturnSuccess) {
+            std::cerr << "Failed to read the RTL8822C report. Error: 0x"
+                      << std::hex << kr << std::dec << "\n";
+            return 1;
+        }
+        std::cout << "=== RealtekRTL8822C Diagnostic Report ===\n"
+                  << report;
+        return 0;
     }
 
     // 1. Locate RealtekRTL8822C service in IORegistry
@@ -148,7 +171,7 @@ int main(int argc, char* argv[]) {
             return 2;
         }
         std::cout << snapshot << "\n";
-    } else if (cmd == "status" || cmd == "report") {
+    } else if (cmd == "status") {
         // Send UpdateStatus command to driver first to refresh register values
         RTWClientSendCommand(kRTL8822CUserCommandUpdateStatus, "", "", 0);
         CFMutableDictionaryRef properties = nullptr;

@@ -56,8 +56,8 @@
 #endif
 
 #if RTW_DEBUG
-#define RTW_DEBUG_LOG(...) IOLog(__VA_ARGS__)
-#define RTW_ERROR_LOG(...) IOLog(__VA_ARGS__)
+#define RTW_DEBUG_LOG(...) do { } while (0)
+#define RTW_ERROR_LOG(...) do { } while (0)
 #define RTW_DEBUG_PROPERTY(...) setProperty(__VA_ARGS__)
 #define RTW_DEBUG_REMOVE_PROPERTY(...) removeProperty(__VA_ARGS__)
 #else
@@ -148,6 +148,23 @@ static const IOOptionBits kRtwDmaPayloadMemoryOptions =
     kIODirectionInOut | kIOMapCopybackCache |
     kIOMemoryPhysicallyContiguous;
 static const UInt64 kRtwRecentScanMaxAgeNs = 10000000000ULL;
+
+// RTL8822C's upstream PCI PHY tables are intentionally empty today. Keep the
+// table-driven boundary local so a board-specific cut entry can be added
+// without changing startup policy or importing Linux implementation details.
+struct RtwPciPhyParameter {
+    UInt16 offset;
+    UInt16 value;
+    UInt16 cutMask;
+    bool phy;
+};
+
+static const RtwPciPhyParameter kRtw8822CGen1PhyParameters[] = {
+    { 0xffff, 0x0000, 0xffff, true }
+};
+static const RtwPciPhyParameter kRtw8822CGen2PhyParameters[] = {
+    { 0xffff, 0x0000, 0xffff, true }
+};
 
 struct RtwScanChannel {
     UInt8 channel;
@@ -345,6 +362,18 @@ private:
     bool suspendHardware();
     bool rollbackFailedResume(const char* stage);
     bool failStart(IOService* provider, const char* status, const char* event);
+    void beginStartDiagnostics(IOPCIDevice* provider);
+    void publishStartStage(UInt32 code, const char* stage);
+    void publishStartFailure(const char* failure, const char* detail);
+    void publishStartReady();
+    void publishPciCompatibilitySnapshot();
+    void publishChipCompatibilitySnapshot(UInt32 chipVersion);
+    void publishEfuseCompatibilitySnapshot(bool valid);
+    bool readPcieDbi8(UInt16 address, UInt8* value);
+    bool writePcieDbi8(UInt16 address, UInt8 value);
+    bool writePcieMdio16(UInt8 address, UInt16 value, bool gen1);
+    bool configurePciPhyCompatibility();
+    void setRfe6ClkreqPadLow(bool low);
     bool prepareDmaMapping(IOBufferMemoryDescriptor* descriptor,
                            IODMACommand* command, addr64_t* address);
     void maskAndAckInterrupts();
@@ -691,6 +720,19 @@ private:
     UInt8 logicalEfuseMap[768];
     UInt8 rfeOption;
     UInt32 cutVersion;
+    UInt8 rfPathMask;
+    UInt8 rfPathCount;
+    UInt32 startStageCode;
+    const char* startStageName;
+    UInt8 pcieCapabilityOffset;
+    UInt8 pcieLinkSpeed;
+    UInt8 pcieLinkWidth;
+    UInt16 originalPcieDeviceControl;
+    UInt16 originalPcieLinkControl;
+    bool pcieControlsSaved;
+#if RTW_DEBUG
+    char startStageTrace[768];
+#endif
     UInt16 h2cSeq;
     UInt8 lastBoxNum;
     bool readEfuse();
@@ -1389,6 +1431,20 @@ bool RealtekRTL8822C::init(OSDictionary* dictionary) {
     h2cSeq = 0;
     lastBoxNum = 0;
     rfeOption = 0;
+    cutVersion = 0;
+    rfPathMask = 0x03;
+    rfPathCount = 2;
+    startStageCode = 0;
+    startStageName = "not-started";
+    pcieCapabilityOffset = 0;
+    pcieLinkSpeed = 0;
+    pcieLinkWidth = 0;
+    originalPcieDeviceControl = 0;
+    originalPcieLinkControl = 0;
+    pcieControlsSaved = false;
+#if RTW_DEBUG
+    startStageTrace[0] = '\0';
+#endif
     memset(physEfuseMap, 0xff, 512);
     memset(logicalEfuseMap, 0xff, 768);
 
@@ -2776,21 +2832,21 @@ bool RealtekRTL8822C::configure5GTxPower(UInt32 primaryChannel,
     const SInt8 ofdmByRate[8] = { 20, 20, 20, 16, 12, 8, 4, 0 };
     const SInt8 ht1sByRate[8] = { 24, 24, 20, 16, 12, 8, 4, 0 };
     const SInt8 vhtByRate[10] = { 24, 24, 20, 16, 12, 8, 4, 0, -4, -8 };
-    SInt8 pathDiff[2][44];
-    UInt8 reference[2];
-    UInt8 rawDiff[2];
-    UInt8 rawHt2Diff[2];
-    UInt8 rawVht1Diff[2];
-    UInt8 rawVht2Diff[2];
-    SInt8 ht2Delta[2];
-    SInt8 ht2Bw40Delta[2];
-    SInt8 vht1Bw80Delta[2];
-    SInt8 vht2Bw80Delta[2];
-    UInt8 base[2];
-    UInt8 upperBase[2];
+    SInt8 pathDiff[2][44] = {};
+    UInt8 reference[2] = {};
+    UInt8 rawDiff[2] = {};
+    UInt8 rawHt2Diff[2] = {};
+    UInt8 rawVht1Diff[2] = {};
+    UInt8 rawVht2Diff[2] = {};
+    SInt8 ht2Delta[2] = {};
+    SInt8 ht2Bw40Delta[2] = {};
+    SInt8 vht1Bw80Delta[2] = {};
+    SInt8 vht2Bw80Delta[2] = {};
+    UInt8 base[2] = {};
+    UInt8 upperBase[2] = {};
     bool valid = true;
 
-    for (UInt8 path = 0; path < 2; path++) {
+    for (UInt8 path = 0; path < rfPathCount; path++) {
         base[path] = logicalEfuseMap[pathOffset[path] + group];
         upperBase[path] = bandwidth == 2 ?
             logicalEfuseMap[pathOffset[path] + group + 1] : base[path];
@@ -2879,13 +2935,14 @@ bool RealtekRTL8822C::configure5GTxPower(UInt32 primaryChannel,
             pathDiff[path][34 + i] = (SInt8)diff;
         }
     }
-    fiveGTwoStreamPowerValid = valid;
+    fiveGTwoStreamPowerValid = valid && rfPathCount == 2;
     if (!valid) return false;
 
     UInt8 commonDiff[44];
     for (UInt8 i = 0; i < 44; i++)
-        commonDiff[i] = (UInt8)((pathDiff[0][i] < pathDiff[1][i]
-                               ? pathDiff[0][i] : pathDiff[1][i]) & 0x7f);
+        commonDiff[i] = (UInt8)((rfPathCount == 2 &&
+                                pathDiff[1][i] < pathDiff[0][i]
+                                    ? pathDiff[1][i] : pathDiff[0][i]) & 0x7f);
     UInt32 ofdmLow = (UInt32)commonDiff[0] | ((UInt32)commonDiff[1] << 8) |
                        ((UInt32)commonDiff[2] << 16) | ((UInt32)commonDiff[3] << 24);
     UInt32 ofdmHigh = (UInt32)commonDiff[4] | ((UInt32)commonDiff[5] << 8) |
@@ -2911,7 +2968,8 @@ bool RealtekRTL8822C::configure5GTxPower(UInt32 primaryChannel,
 
     write32Mask(0x1c90, BIT(15), 0);
     write32Mask(0x18e8, 0x0001fc00, reference[0]);
-    write32Mask(0x41e8, 0x0001fc00, reference[1]);
+    if (rfPathCount == 2)
+        write32Mask(0x41e8, 0x0001fc00, reference[1]);
     write32(0x3a04, ofdmLow);
     write32(0x3a08, ofdmHigh);
     write32(0x3a0c, htLow);
@@ -2950,7 +3008,7 @@ bool RealtekRTL8822C::configure5GTxPower(UInt32 primaryChannel,
 
         char db[1024];
         snprintf(db, sizeof(db),
-             "fcc-us primary=%u center=%u bw=%u group=%u base=%02x/%02x upper=%02x/%02x rawdiff=%02x/%02x ht2raw=%02x/%02x vht80raw=%02x/%02x/%02x/%02x ht2delta20=%d/%d ht2delta40=%d/%d vhtdelta80=%d/%d/%d/%d ref=%u/%u limits=%d/%d/%d/%d/%d legacy=%08x/%08x ht=%08x/%08x/%08x/%08x vht=%08x/%08x/%08x/%08x/%08x report6m=%02x reportmcs7=%02x reportmcs15=%02x reportvht1mcs9=%02x reportvht2mcs9=%02x valid=1 streams=2",
+             "fcc-us primary=%u center=%u bw=%u group=%u base=%02x/%02x upper=%02x/%02x rawdiff=%02x/%02x ht2raw=%02x/%02x vht80raw=%02x/%02x/%02x/%02x ht2delta20=%d/%d ht2delta40=%d/%d vhtdelta80=%d/%d/%d/%d ref=%u/%u limits=%d/%d/%d/%d/%d legacy=%08x/%08x ht=%08x/%08x/%08x/%08x vht=%08x/%08x/%08x/%08x/%08x report6m=%02x reportmcs7=%02x reportmcs15=%02x reportvht1mcs9=%02x reportvht2mcs9=%02x valid=1 streams=%u",
              (unsigned int)primaryChannel, (unsigned int)centerChannel,
              bandwidth == 2 ? 80U : (bandwidth == 1 ? 40U : 20U), group,
              base[0], base[1], upperBase[0], upperBase[1], rawDiff[0], rawDiff[1],
@@ -2968,7 +3026,8 @@ bool RealtekRTL8822C::configure5GTxPower(UInt32 primaryChannel,
              (unsigned int)vht1Low, (unsigned int)vht1High,
              (unsigned int)vhtMix, (unsigned int)vht2Mid,
              (unsigned int)vht2High, report6m, reportMcs7, reportMcs15,
-             reportVht1Mcs9, reportVht2Mcs9);
+             reportVht1Mcs9, reportVht2Mcs9,
+             (unsigned int)rfPathCount);
         RTW_DEBUG_PROPERTY("Debug_5G_TXAGC", db);
         char powerDb[256];
         snprintf(powerDb, sizeof(powerDb),
@@ -3003,16 +3062,18 @@ UInt32 RealtekRTL8822C::programChannelRf(UInt32 rfReg18A, UInt32 rfReg18B,
     writeRfMask(0, 0x33, 0x1f, 0x12); // RF_LUTWA
     writeRfMask(0, 0x3f, 0xfffff, rfRxbb); // RF_LUTWD0
     writeRfMask(0, 0xee, 0x04, 0x00);
-    writeRfMask(1, 0xee, 0x04, 0x01);
-    writeRfMask(1, 0x33, 0x1f, 0x12);
-    writeRfMask(1, 0x3f, 0xfffff, rfRxbb);
-    writeRfMask(1, 0xee, 0x04, 0x00);
+    if (rfPathCount == 2) {
+        writeRfMask(1, 0xee, 0x04, 0x01);
+        writeRfMask(1, 0x33, 0x1f, 0x12);
+        writeRfMask(1, 0x3f, 0xfffff, rfRxbb);
+        writeRfMask(1, 0xee, 0x04, 0x00);
+    }
 
     writeRfMask(0, 0x18, 0xfffff, rfReg18A);
-    writeRfMask(1, 0x18, 0xfffff, rfReg18B);
+    if (rfPathCount == 2) writeRfMask(1, 0x18, 0xfffff, rfReg18B);
     write32Mask(0x1c90, 0x100, 1);
     write32Mask(0x1830, 0x20000000, 1);
-    write32Mask(0x4130, 0x20000000, 1);
+    if (rfPathCount == 2) write32Mask(0x4130, 0x20000000, 1);
     OSSynchronizeIO();
 
     // Linux rtw8822c_toggle_igi(). Keep the guard used by the existing port
@@ -3036,7 +3097,8 @@ bool RealtekRTL8822C::setChannelHw(UInt32 channel, UInt32 flags, UInt8 bandwidth
     if (channel == 0 || channel > 177) return false;
 
     UInt32 orig_a = readRfMask(0, 0x18, 0xfffff);
-    UInt32 orig_b = readRfMask(1, 0x18, 0xfffff);
+    UInt32 orig_b = rfPathCount == 2 ?
+        readRfMask(1, 0x18, 0xfffff) : orig_a;
 
     UInt32 rf_reg18_a = orig_a;
     UInt32 rf_reg18_b = orig_b;
@@ -3154,12 +3216,12 @@ bool RealtekRTL8822C::setChannelHw(UInt32 channel, UInt32 flags, UInt8 bandwidth
                 RTW_DEBUG_LOG("RealtekRTL8822C: Applied Path A OFDM Power Ref: %u\n", ofdm_a);
         }
 
-        if (cck_b != 0xFF && cck_b <= 0x7F) {
+        if (rfPathCount == 2 && cck_b != 0xFF && cck_b <= 0x7F) {
             write32Mask(0x41a0, 0x007f0000, cck_b); // CCK reference path B
             if (publishDiagnostics)
                 RTW_DEBUG_LOG("RealtekRTL8822C: Applied Path B CCK Power Ref: %u\n", cck_b);
         }
-        if (ofdm_b != 0xFF && ofdm_b <= 0x7F) {
+        if (rfPathCount == 2 && ofdm_b != 0xFF && ofdm_b <= 0x7F) {
             write32Mask(0x41e8, 0x0001fc00, ofdm_b); // OFDM reference path B
             if (publishDiagnostics)
                 RTW_DEBUG_LOG("RealtekRTL8822C: Applied Path B OFDM Power Ref: %u\n", ofdm_b);
@@ -3458,8 +3520,268 @@ bool RealtekRTL8822C::failStart(IOService* provider, const char* status,
                                const char* event) {
     if (status) setProperty("DriverStatus", status);
     if (event) traceEvent(event);
+    const OSString* detailProperty = OSDynamicCast(OSString, getProperty("DriverStatus"));
+    const char* detail = detailProperty ? detailProperty->getCStringNoCopy() : status;
+    publishStartFailure(event ? event : "hardware-init-failed", detail);
     stop(provider);
     return false;
+}
+
+void RealtekRTL8822C::beginStartDiagnostics(IOPCIDevice* provider) {
+    pciDevice = provider;
+    startStageCode = 0;
+    startStageName = "provider";
+#if RTW_DEBUG
+    startStageTrace[0] = '\0';
+#endif
+    provider->setProperty("RTL8822CStartResult", "starting");
+    provider->setProperty("RTL8822CStartStage", startStageName);
+    provider->setProperty("RTL8822CStartStageCode", (uint64_t)startStageCode, 32);
+    provider->setProperty("RTL8822CDriverVersion", RTW_VERSION);
+    provider->setProperty("RTL8822CBuildConfiguration",
+                          RTW_DEBUG ? "Debug" : "Release");
+    provider->setProperty("RTL8822CBuildTargetMacOS", RTW_DRIVER_BUILD_TARGET);
+    provider->removeProperty("RTL8822CStartFailure");
+    provider->removeProperty("RTL8822CChipVersion");
+    provider->removeProperty("RTL8822CChipCut");
+    provider->removeProperty("RTL8822CRFPathCount");
+    provider->removeProperty("RTL8822CRFEOption");
+    provider->removeProperty("RTL8822CPCIELinkSpeed");
+    provider->removeProperty("RTL8822CPCIELinkWidth");
+    provider->removeProperty("RTL8822CPCIPhyConfig");
+    provider->removeProperty("RTL8822CPCIeLinkConfig");
+#if RTW_DEBUG
+    provider->removeProperty("RTL8822CDebugFailureDetail");
+    provider->removeProperty("RTL8822CDebugStartTrace");
+    provider->removeProperty("RTL8822CDebugPCISnapshot");
+    provider->removeProperty("RTL8822CDebugChipSnapshot");
+    provider->removeProperty("RTL8822CDebugEFUSESummary");
+    provider->removeProperty("RTL8822CDebugRFE6CLKREQ");
+    provider->removeProperty("RTL8822CDebugDBISetup");
+    provider->removeProperty("RTL8822CDebugPCIPhyConfig");
+#endif
+}
+
+void RealtekRTL8822C::publishStartStage(UInt32 code, const char* stage) {
+    startStageCode = code;
+    startStageName = stage ? stage : "unknown";
+    if (!pciDevice) return;
+    pciDevice->setProperty("RTL8822CStartStage", startStageName);
+    pciDevice->setProperty("RTL8822CStartStageCode", (uint64_t)code, 32);
+#if RTW_DEBUG
+    char entry[96];
+    snprintf(entry, sizeof(entry), "%s%u:%s",
+             startStageTrace[0] ? " | " : "", (unsigned int)code,
+             startStageName);
+    strlcat(startStageTrace, entry, sizeof(startStageTrace));
+    pciDevice->setProperty("RTL8822CDebugStartTrace", startStageTrace);
+#endif
+}
+
+void RealtekRTL8822C::publishStartFailure(const char* failure,
+                                          const char* detail) {
+    if (!pciDevice) return;
+    pciDevice->setProperty("RTL8822CStartResult", "failed");
+    pciDevice->setProperty("RTL8822CStartStage",
+                           startStageName ? startStageName : "unknown");
+    pciDevice->setProperty("RTL8822CStartStageCode",
+                           (uint64_t)startStageCode, 32);
+    pciDevice->setProperty("RTL8822CStartFailure",
+                           failure ? failure : "unknown");
+#if RTW_DEBUG
+    if (detail) pciDevice->setProperty("RTL8822CDebugFailureDetail", detail);
+#else
+    (void)detail;
+#endif
+}
+
+void RealtekRTL8822C::publishStartReady() {
+    if (!pciDevice) return;
+    pciDevice->setProperty("RTL8822CStartResult", "ready");
+    pciDevice->removeProperty("RTL8822CStartFailure");
+    publishStartStage(20, "operational");
+}
+
+void RealtekRTL8822C::publishPciCompatibilitySnapshot() {
+    if (!pciDevice) return;
+    UInt32 identity = pciDevice->configRead32(0x00);
+    UInt32 classRevision = pciDevice->configRead32(0x08);
+    UInt32 subsystem = pciDevice->configRead32(0x2c);
+    pciDevice->setProperty("RTL8822CPCIVendor", (uint64_t)(identity & 0xffffU), 16);
+    pciDevice->setProperty("RTL8822CPCIDevice", (uint64_t)(identity >> 16), 16);
+    pciDevice->setProperty("RTL8822CPCIRevision",
+                           (uint64_t)(classRevision & 0xffU), 8);
+    pciDevice->setProperty("RTL8822CPCISubsystemVendor",
+                           (uint64_t)(subsystem & 0xffffU), 16);
+    pciDevice->setProperty("RTL8822CPCISubsystemDevice",
+                           (uint64_t)(subsystem >> 16), 16);
+#if RTW_DEBUG
+    UInt32 commandStatus = pciDevice->configRead32(0x04);
+    char snapshot[384];
+    snprintf(snapshot, sizeof(snapshot),
+             "id=%04x:%04x rev=%02x class=%06x subsystem=%04x:%04x command=%04x status=%04x bars=%08x/%08x/%08x/%08x/%08x/%08x",
+             identity & 0xffffU, identity >> 16, classRevision & 0xffU,
+             classRevision >> 8, subsystem & 0xffffU, subsystem >> 16,
+             commandStatus & 0xffffU, commandStatus >> 16,
+             pciDevice->configRead32(0x10), pciDevice->configRead32(0x14),
+             pciDevice->configRead32(0x18), pciDevice->configRead32(0x1c),
+             pciDevice->configRead32(0x20), pciDevice->configRead32(0x24));
+    pciDevice->setProperty("RTL8822CDebugPCISnapshot", snapshot);
+#endif
+}
+
+void RealtekRTL8822C::publishChipCompatibilitySnapshot(UInt32 chipVersion) {
+    if (!pciDevice) return;
+    pciDevice->setProperty("RTL8822CChipVersion", (uint64_t)chipVersion, 32);
+    pciDevice->setProperty("RTL8822CChipCut", (uint64_t)cutVersion, 8);
+    pciDevice->setProperty("RTL8822CRFPathCount", (uint64_t)rfPathCount, 8);
+#if RTW_DEBUG
+    char snapshot[192];
+    snprintf(snapshot, sizeof(snapshot),
+             "sys_cfg1=%08x cut=%u mp=%u rf=%s paths=0x%x",
+             chipVersion, (unsigned int)cutVersion,
+             (chipVersion & (1U << 23)) ? 0U : 1U,
+             rfPathCount == 2 ? "2T2R" : "1T1R", rfPathMask);
+    pciDevice->setProperty("RTL8822CDebugChipSnapshot", snapshot);
+#endif
+}
+
+void RealtekRTL8822C::publishEfuseCompatibilitySnapshot(bool valid) {
+    if (!pciDevice) return;
+    if (valid)
+        pciDevice->setProperty("RTL8822CRFEOption", (uint64_t)rfeOption, 8);
+#if RTW_DEBUG
+    UInt32 erasedPhysical = 0;
+    UInt32 erasedLogical = 0;
+    for (UInt32 i = 0; i < sizeof(physEfuseMap); i++)
+        if (physEfuseMap[i] == 0xff) erasedPhysical++;
+    for (UInt32 i = 0; i < sizeof(logicalEfuseMap); i++)
+        if (logicalEfuseMap[i] == 0xff) erasedLogical++;
+    char snapshot[256];
+    snprintf(snapshot, sizeof(snapshot),
+             "valid=%d rfe=%u physical_erased=%u/512 logical_erased=%u/768 crystal=%02x trims=%02x/%02x/%02x/%02x/%02x/%02x",
+             valid ? 1 : 0, (unsigned int)rfeOption, (unsigned int)erasedPhysical,
+             (unsigned int)erasedLogical, logicalEfuseMap[0xb9],
+             physEfuseMap[0x1d4], physEfuseMap[0x1ee],
+             physEfuseMap[0x1d2], physEfuseMap[0x1d6],
+             physEfuseMap[0x1d5], physEfuseMap[0x1d8]);
+    pciDevice->setProperty("RTL8822CDebugEFUSESummary", snapshot);
+#endif
+#if !RTW_DEBUG
+    (void)valid;
+#endif
+}
+
+bool RealtekRTL8822C::readPcieDbi8(UInt16 address, UInt8* value) {
+    if (!ioBase || !value) return false;
+    UInt16 readAddress = address & 0x0ffcU;
+    write16(0x03f0, readAddress);
+    write8(0x03f2, 0x02); // BIT_DBI_RFLAG >> 16
+    for (UInt32 retry = 0; retry < 20; retry++) {
+        if (read8(0x03f2) == 0) {
+            *value = read8(0x03ec + (address & 3U));
+            return true;
+        }
+        IODelay(10);
+    }
+    return false;
+}
+
+bool RealtekRTL8822C::writePcieDbi8(UInt16 address, UInt8 value) {
+    if (!ioBase) return false;
+    UInt16 remainder = address & 3U;
+    UInt16 writeAddress = (address & 0x0ffcU) |
+        (UInt16)(1U << (12U + remainder));
+    write8(0x03e8 + remainder, value);
+    write16(0x03f0, writeAddress);
+    write8(0x03f2, 0x01); // BIT_DBI_WFLAG >> 16
+    for (UInt32 retry = 0; retry < 20; retry++) {
+        if (read8(0x03f2) == 0) return true;
+        IODelay(10);
+    }
+    return false;
+}
+
+bool RealtekRTL8822C::writePcieMdio16(UInt8 address, UInt16 value, bool gen1) {
+    if (!ioBase) return false;
+    write16(0x03f4, value);
+    UInt8 page = (address >= 0x20 ? 1 : 0) + (gen1 ? 0 : 2);
+    write8(0x03f8, address & 0x1f);
+    write8(0x03fb, page);
+    write32(0x03f8, read32(0x03f8) | (1U << 5));
+    for (UInt32 retry = 0; retry < 20; retry++) {
+        if ((read32(0x03f8) & (1U << 5)) == 0) return true;
+        IODelay(10);
+    }
+    return false;
+}
+
+bool RealtekRTL8822C::configurePciPhyCompatibility() {
+    if (!pciDevice || !ioBase) return false;
+
+    UInt16 linkStatus = 0;
+    if (pcieCapabilityOffset != 0) {
+        linkStatus = pciDevice->configRead16(pcieCapabilityOffset + 0x12);
+        pcieLinkSpeed = linkStatus & 0x0f;
+        pcieLinkWidth = (linkStatus >> 4) & 0x3f;
+        pciDevice->setProperty("RTL8822CPCIELinkSpeed", (uint64_t)pcieLinkSpeed, 8);
+        pciDevice->setProperty("RTL8822CPCIELinkWidth", (uint64_t)pcieLinkWidth, 8);
+    }
+
+    UInt16 cutMask = cutVersion < 16 ? (UInt16)(1U << cutVersion) : 0;
+    UInt32 applied = 0;
+    UInt32 failed = 0;
+    const RtwPciPhyParameter* tables[] = {
+        kRtw8822CGen1PhyParameters, kRtw8822CGen2PhyParameters
+    };
+    const UInt32 counts[] = {
+        sizeof(kRtw8822CGen1PhyParameters) / sizeof(kRtw8822CGen1PhyParameters[0]),
+        sizeof(kRtw8822CGen2PhyParameters) / sizeof(kRtw8822CGen2PhyParameters[0])
+    };
+    for (UInt32 gen = 0; gen < 2; gen++) {
+        for (UInt32 i = 0; i < counts[gen]; i++) {
+            const RtwPciPhyParameter& parameter = tables[gen][i];
+            if (parameter.offset == 0xffff) break;
+            if ((parameter.cutMask & cutMask) == 0) continue;
+            bool ok = parameter.phy
+                ? writePcieMdio16((UInt8)parameter.offset, parameter.value, gen == 0)
+                : writePcieDbi8(parameter.offset, (UInt8)parameter.value);
+            if (ok) applied++; else failed++;
+        }
+    }
+
+    bool capabilityMissing = pcieCapabilityOffset == 0;
+    const char* result = (failed || capabilityMissing) ? "nonfatal-warning" :
+                         (applied ? "applied" : "no-matching-parameters");
+    pciDevice->setProperty("RTL8822CPCIPhyConfig", result);
+#if RTW_DEBUG
+    char detail[192];
+    snprintf(detail, sizeof(detail),
+             "speed=%u width=x%u cut=%u gen1=%u gen2=%u applied=%u failed=%u",
+             (unsigned int)pcieLinkSpeed, (unsigned int)pcieLinkWidth,
+             (unsigned int)cutVersion,
+             pcieLinkSpeed == 1 ? 1U : 0U, pcieLinkSpeed >= 2 ? 1U : 0U,
+             (unsigned int)applied, (unsigned int)failed);
+    pciDevice->setProperty("RTL8822CDebugPCIPhyConfig", detail);
+#endif
+    return failed == 0 && !capabilityMissing;
+}
+
+void RealtekRTL8822C::setRfe6ClkreqPadLow(bool low) {
+    if (rfeOption != 6 || !ioBase) return;
+    UInt8 linkConfig = 0;
+    bool readOk = readPcieDbi8(0x0719, &linkConfig);
+    bool writeOk = readOk && writePcieDbi8(
+        0x0719, low ? (UInt8)(linkConfig & ~0x01U) :
+                      (UInt8)(linkConfig | 0x01U));
+#if RTW_DEBUG
+    char state[128];
+    snprintf(state, sizeof(state), "low=%d read=%d write=%d before=%02x",
+             low ? 1 : 0, readOk ? 1 : 0, writeOk ? 1 : 0, linkConfig);
+    if (pciDevice) pciDevice->setProperty("RTL8822CDebugRFE6CLKREQ", state);
+#else
+    (void)writeOk;
+#endif
 }
 
 bool RealtekRTL8822C::prepareDmaMapping(IOBufferMemoryDescriptor* descriptor,
@@ -3486,11 +3808,17 @@ bool RealtekRTL8822C::start(IOService* provider) {
     IOPCIDevice* earlyPciDevice = OSDynamicCast(IOPCIDevice, provider);
     if (!earlyPciDevice) return false;
 
+    beginStartDiagnostics(earlyPciDevice);
+    publishPciCompatibilitySnapshot();
+
     // IONetworkController::start() joins the controller to the provider's PM
     // tree. Mark the PCI provider before that can trigger an eligibility scan.
     earlyPciDevice->setProperty("IOPMIsPowerManaged", kOSBooleanTrue);
 
+    publishStartStage(2, "superclass");
     if (!super::start(provider)) {
+        publishStartFailure("superclass-start-failed", nullptr);
+        pciDevice = nullptr;
         return false;
     }
 
@@ -3532,45 +3860,52 @@ bool RealtekRTL8822C::start(IOService* provider) {
 
     pciDevice->setMemoryEnable(true);
     pciDevice->setBusMasterEnable(true);
+    publishStartStage(3, "pci-configuration");
 
     // Configure PCIe capability: Relaxed Ordering and No Snoop
     UInt8 pcie_cap_offset = 0;
-    UInt8 cap_ptr = pciDevice->configRead8(0x34); // Capabilities Pointer
-    while (cap_ptr != 0) {
+    UInt8 cap_ptr = pciDevice->configRead8(0x34) & 0xfcU;
+    for (UInt32 hop = 0; cap_ptr >= 0x40U && hop < 48; hop++) {
         UInt8 cap_id = pciDevice->configRead8(cap_ptr);
         if (cap_id == 0x10) { // PCI_CAP_ID_EXP (PCI Express Capability)
             pcie_cap_offset = cap_ptr;
             break;
         }
-        cap_ptr = pciDevice->configRead8(cap_ptr + 1);
+        UInt8 next = pciDevice->configRead8(cap_ptr + 1) & 0xfcU;
+        if (next == cap_ptr) break;
+        cap_ptr = next;
     }
     if (pcie_cap_offset != 0) {
         UInt16 dev_ctl = pciDevice->configRead16(pcie_cap_offset + 0x08);
         RTW_DEBUG_PROPERTY("Debug_PCIe_DevCtl_Before", dev_ctl, 16);
-        dev_ctl |= (1 << 11); // Enable No Snoop
-        dev_ctl |= (1 << 4);  // Enable Relaxed Ordering
-        pciDevice->configWrite16(pcie_cap_offset + 0x08, dev_ctl);
-#if RTW_DEBUG
-        UInt16 dev_ctl_after = pciDevice->configRead16(pcie_cap_offset + 0x08);
-        RTW_DEBUG_PROPERTY("Debug_PCIe_DevCtl_After", dev_ctl_after, 16);
-#endif
-
         UInt16 link_ctl = pciDevice->configRead16(pcie_cap_offset + 0x10);
         RTW_DEBUG_PROPERTY("Debug_PCIe_LinkCtl_Before", link_ctl, 16);
+        pcieCapabilityOffset = pcie_cap_offset;
+        originalPcieDeviceControl = dev_ctl;
+        originalPcieLinkControl = link_ctl;
+        pcieControlsSaved = true;
+
+        // No Snoop and Relaxed Ordering are host policy and are no longer
+        // forced. Keep the established ASPM-off behavior for this experimental
+        // driver, but restore the original value on every stop/failure.
         link_ctl &= ~0x0003; // Disable ASPM (clear bits 0-1)
         pciDevice->configWrite16(pcie_cap_offset + 0x10, link_ctl);
 #if RTW_DEBUG
+        UInt16 dev_ctl_after = pciDevice->configRead16(pcie_cap_offset + 0x08);
         UInt16 link_ctl_after = pciDevice->configRead16(pcie_cap_offset + 0x10);
+        RTW_DEBUG_PROPERTY("Debug_PCIe_DevCtl_After", dev_ctl_after, 16);
         RTW_DEBUG_PROPERTY("Debug_PCIe_LinkCtl_After", link_ctl_after, 16);
 #endif
     }
 
+    publishStartStage(4, "bar-discovery");
     bar2Desc = pciDevice->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
     if (!bar2Desc) {
         return failStart(provider, "Failed to get BAR2 descriptor",
                          "start:bar2-descriptor-failed");
     }
 
+    publishStartStage(5, "bar-mapping");
     bar2Map = bar2Desc->map();
     if (!bar2Map) {
         return failStart(provider, "Failed to map BAR2",
@@ -3579,6 +3914,42 @@ bool RealtekRTL8822C::start(IOService* provider) {
 
     ioBase = (volatile UInt8*)bar2Map->getVirtualAddress();
     traceEvent("start:bar2-mapped");
+
+    // Read the silicon identity before creating interrupt and DMA resources so
+    // even an early compatibility failure leaves a useful provider snapshot.
+    publishStartStage(6, "chip-identification");
+    UInt32 chip_version = read32(0x00F0);
+    setProperty("Hardware_CHIP_VERSION", chip_version, 32);
+    cutVersion = (chip_version >> 12) & 0x0F;
+    rfPathCount = (chip_version & (1U << 27)) ? 2 : 1;
+    rfPathMask = rfPathCount == 2 ? 0x03 : 0x01;
+    publishChipCompatibilitySnapshot(chip_version);
+
+    // Linux rtw_pci_interface_cfg(): cut D and newer require the auxiliary
+    // EMAC power-down path to use the fast clock.
+    if (cutVersion >= 3)
+        write32Mask(0x03fc, 1U << 26, 1);
+
+    // The table is deliberately bounded and currently sentinel-only for
+    // RTL8822C. A failed optional DBI/MDIO transaction is retained as a
+    // compatibility warning; BAR, firmware, EFUSE, DMA and core PHY failures
+    // below remain fatal and still stop startup.
+    publishStartStage(6, "pci-phy-compatibility");
+    (void)configurePciPhyCompatibility();
+
+    // Linux rtw_pci_link_cfg(): RTL8822CE performs automatic REFCLK
+    // calibration and must not retain a board-specific clock delay.
+    bool refClockDelayCleared = writePcieDbi8(0x0725, 0);
+    pciDevice->setProperty("RTL8822CPCIeLinkConfig",
+                           refClockDelayCleared ? "ready" :
+                                                  "nonfatal-warning");
+#if RTW_DEBUG
+    pciDevice->setProperty("RTL8822CDebugDBISetup",
+                           refClockDelayCleared ? "refclk-delay=cleared" :
+                                                  "refclk-delay=write-failed");
+#else
+    (void)refClockDelayCleared;
+#endif
 
     // Configure and publish network media
     OSDictionary* mediumDict = OSDictionary::withCapacity(1);
@@ -3599,6 +3970,7 @@ bool RealtekRTL8822C::start(IOService* provider) {
                          "start:medium-failed");
     }
 
+    publishStartStage(7, "interrupt-discovery");
     // Setup Interrupts - use IO80211WorkLoop (createWorkLoop already called by super)
     if (!workLoop) {
         workLoop = getWorkLoop();
@@ -3692,14 +4064,10 @@ bool RealtekRTL8822C::start(IOService* provider) {
 
     RTW_DEBUG_PROPERTY("Debug_BAR2_Length", bar2Map->getLength(), 32);
 
-    // Read Chip Version (SYS_CFG1 = 0x00F0)
-    UInt32 chip_version = read32(0x00F0);
-    setProperty("Hardware_CHIP_VERSION", chip_version, 32);
-    cutVersion = (chip_version >> 12) & 0x0F;
-
     // Test read32(0x1208) early
     // (Moved to downloadFirmware as Debug_DDMA_After_Init)
 
+    publishStartStage(8, "dma-allocation");
     // Phase 2: DMA (Direct Memory Access) and Ring Buffers. Descriptor rings
     // remain uncached; packet arenas use coherent copy-back mappings.
     bcnqDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
@@ -3945,43 +4313,52 @@ bool RealtekRTL8822C::start(IOService* provider) {
     write16(0x0382, 512); // RTK_PCI_RXBD_NUM_MPDUQ (512 descriptors)
     write16(0x03B4, 0);   // Clear Host Read Pointer
 
-    if (downloadFirmware()) {
-        if (readEfuse()) {
-            if (initMac()) {
-                initCoexWifiOnly();
-                if (initPhy()) {
-                    // Run the pre-OTA TXAGC diagnostic on a known 2.4 GHz channel.
-                    bool channelReady = setChannelHw(1, 0);
-                    bool txdmaReady = channelReady &&
-                        clearTxdmaLifecycleStatus("cold-start");
-                    if (channelReady && txdmaReady) {
-                        setProperty("DriverStatus", "Firmware loaded, EFUSE parsed, MAC/PHY initialized, IQK success!");
-                        traceEvent("start:hw-init-complete");
-                        hardwareReady = true;
-                        hardwareSuspended = false;
-                    } else {
-                        setProperty("DriverStatus", channelReady ?
-                                    "Cold-start TXDMA status did not clear" :
-                                    "Cold-start channel setup failed");
-                        traceEvent(channelReady ? "start:txdma-status-failed" :
-                                                  "start:channel-failed");
-                    }
-                } else {
-                    setProperty("DriverStatus", "PHY Initialization or IQK Failed!");
-                    traceEvent("start:phy-init-failed");
-                }
-            }
-        }
-    } else {
-        // DriverStatus already set by downloadFirmware with the specific error
-    }
+    publishStartStage(9, "power-sequence");
+    if (!downloadFirmware())
+        return failStart(provider, nullptr, "firmware-download-failed");
 
-    if (!hardwareReady) {
-        traceEvent("start:hardware-init-failed");
-        return failStart(provider, nullptr, nullptr);
+    publishStartStage(11, "efuse-read");
+    if (!readEfuse()) {
+        publishEfuseCompatibilitySnapshot(false);
+        return failStart(provider, nullptr, "efuse-read-failed");
     }
+    publishStartStage(12, "board-identification");
+    publishEfuseCompatibilitySnapshot(true);
+    if (rfeOption > 6)
+        return failStart(provider, "Unsupported or erased EFUSE RFE option",
+                         "unsupported-rfe-option");
+
+    // Linux rtw_pci_phy_cfg(): RFE type 5 selects the alternate CF_L path.
+    if (rfeOption == 5)
+        write32Mask(0x1010, 0x30000000U, 1);
+
+    publishStartStage(13, "mac-initialization");
+    if (!initMac())
+        return failStart(provider, nullptr, "mac-initialization-failed");
+    initCoexWifiOnly();
+
+    publishStartStage(14, "phy-initialization");
+    if (!initPhy())
+        return failStart(provider, "PHY initialization or calibration failed",
+                         "phy-initialization-failed");
+
+    publishStartStage(15, "calibration");
+    publishStartStage(16, "initial-channel");
+    bool channelReady = setChannelHw(1, 0);
+    if (!channelReady)
+        return failStart(provider, "Cold-start channel setup failed",
+                         "initial-channel-failed");
+    if (!clearTxdmaLifecycleStatus("cold-start"))
+        return failStart(provider, "Cold-start TXDMA status did not clear",
+                         "txdma-status-failed");
+
+    setProperty("DriverStatus", "Firmware loaded, EFUSE parsed, MAC/PHY initialized, IQK success!");
+    traceEvent("start:hw-init-complete");
+    hardwareReady = true;
+    hardwareSuspended = false;
 
     // Attach Network Interface (IO80211Interface)
+    publishStartStage(17, "network-interface");
     if (!attachInterface((IONetworkInterface**)&netif, true)) {
         return failStart(provider, "Failed to attach Ethernet interface",
                          "start:interface-attach-failed");
@@ -3990,6 +4367,7 @@ bool RealtekRTL8822C::start(IOService* provider) {
     setLinkStatus(kIONetworkLinkValid);
     RTW_DEBUG_PROPERTY("Debug_netif_val", (uint64_t)netif, 64);
 
+    publishStartStage(18, "packet-reserve");
     if (!setupRxPacketPool()) {
         return failStart(provider, "Failed to prepare RX packet reserve",
                          "start:rx-packet-pool-failed");
@@ -3998,6 +4376,7 @@ bool RealtekRTL8822C::start(IOService* provider) {
     // Clear all pending HISR bits first (Write-1-to-Clear: write 0xFFFFFFFF)
     // This acknowledges any stale interrupt state from init/IQK so the first
     // ISR call we receive is truly a new event from the card.
+    publishStartStage(19, "interrupt-enable");
     if (interruptSource) interruptSource->enable();
     enableHardwareInterrupts();
     if (scanTimer) {
@@ -4011,6 +4390,7 @@ bool RealtekRTL8822C::start(IOService* provider) {
 
 
     registerService();
+    publishStartReady();
     return true;
 }
 
@@ -4158,6 +4538,13 @@ void RealtekRTL8822C::stop(IOService* provider) {
     }
     bar2Desc = nullptr;
     if (pciDevice) {
+        if (pcieControlsSaved && pcieCapabilityOffset != 0) {
+            pciDevice->configWrite16(pcieCapabilityOffset + 0x08,
+                                     originalPcieDeviceControl);
+            pciDevice->configWrite16(pcieCapabilityOffset + 0x10,
+                                     originalPcieLinkControl);
+        }
+        pcieControlsSaved = false;
         pciDevice->release();
         pciDevice = nullptr;
     }
@@ -4393,6 +4780,7 @@ bool RealtekRTL8822C::suspendHardware() {
     if (interruptSource) interruptSource->disable();
     write8(0x0522, 0xff);
     OSSynchronizeIO();
+    setRfe6ClkreqPadLow(true);
 
     bool enteredCardEmu = parsePowerSeq(trans_act_to_cardemu_8822c);
     bool enteredCardDis = parsePowerSeq(trans_cardemu_to_carddis_8822c);
@@ -4415,6 +4803,7 @@ bool RealtekRTL8822C::resumeHardware() {
 
     pciDevice->setMemoryEnable(true);
     pciDevice->setBusMasterEnable(true);
+    setRfe6ClkreqPadLow(false);
     channelCalibrationValid = false;
     calibratedChannel = 0;
     calibratedBandwidth = 0;
@@ -4828,6 +5217,8 @@ bool RealtekRTL8822C::downloadFirmware() {
         setProperty("DriverStatus", "Failed PowerOn: cardemu_to_act");
         return false;
     }
+
+    publishStartStage(10, "firmware-download");
 
     if (!macInitSystemCfg()) {
         setProperty("DriverStatus", "Failed macInitSystemCfg");
@@ -7783,9 +8174,11 @@ void RealtekRTL8822C::runDackCalibration() {
                             0x1a00, 0x1a14, 0x1d58, 0x1c38, 0x1e24, 0x1e28, 0x1860, 0x4160 };
     UInt32 saved[16], rf8f[2];
     for (UInt32 i = 0; i < 16; i++) saved[i] = read32(regs[i]);
-    for (UInt8 path = 0; path < 2; path++) rf8f[path] = readRfMask(path, 0x8f, 0xfffff);
+    for (UInt8 path = 0; path < 2; path++)
+        rf8f[path] = readRfMask(path, 0x8f, 0xfffff);
     write32Mask(0x1d58, 0xff8, 0x1ff); write32Mask(0x1a00, 0x3, 2); write32Mask(0x1a14, 0x300, 3);
-    write32(0x1d70, 0x7e7e7e7e); write32Mask(0x180c, 0x3, 0); write32Mask(0x410c, 0x3, 0);
+    write32(0x1d70, 0x7e7e7e7e); write32Mask(0x180c, 0x3, 0);
+    write32Mask(0x410c, 0x3, 0);
     write32(0x1b00, 0x00000008); write8(0x1bcc, 0x3f); write32(0x1b00, 0x0000000a); write8(0x1bcc, 0x3f);
     write32Mask(0x1e24, 1U << 31, 0); write32Mask(0x1e28, 0xf, 3);
     UInt32 adcI[2] = {}, adcQ[2] = {}, adcAttempts[2] = {}, residualI[2] = {}, residualQ[2] = {};
@@ -7808,10 +8201,12 @@ void RealtekRTL8822C::runDackCalibration() {
         }
         dackStep4(path);
     }
-    write32(0x1b00, 0x00000008); write32Mask(0x4130, 1U << 30, 1); write8(0x1bcc, 0);
+    write32(0x1b00, 0x00000008); write8(0x1bcc, 0);
+    write32Mask(0x4130, 1U << 30, 1);
     write32(0x1b00, 0x0000000a); write8(0x1bcc, 0);
     for (UInt32 i = 0; i < 16; i++) write32(regs[i], saved[i]);
-    for (UInt8 path = 0; path < 2; path++) writeRfMask(path, 0x8f, 0xfffff, rf8f[path]);
+    for (UInt8 path = 0; path < 2; path++)
+        writeRfMask(path, 0x8f, 0xfffff, rf8f[path]);
     dackBackupResults();
     char status[256];
     snprintf(status, sizeof(status),
@@ -7899,14 +8294,14 @@ void RealtekRTL8822C::runTxGapkCalibration() {
 
     for (UInt32 i = 0; i < sizeof(bbRegs) / sizeof(bbRegs[0]); i++) bbSaved[i] = read32(bbRegs[i]);
     UInt8 txPauseSaved = read8(0x0522);
-    for (UInt8 path = 0; path < 2; path++)
+    for (UInt8 path = 0; path < rfPathCount; path++)
         for (UInt32 i = 0; i < sizeof(rfRegs) / sizeof(rfRegs[0]); i++)
             rfSaved[path][i] = readRfMask(path, rfRegs[i], 0xfffff);
 
     if (startOk) {
         // Linux save_all_tx_gain_table(): capture every band/path before calibration.
         for (UInt8 band = 0; band < 5; band++) {
-            for (UInt8 path = 0; path < 2; path++) {
+            for (UInt8 path = 0; path < rfPathCount; path++) {
                 UInt32 cfgch = readRfMask(path, 0x18, 0xfffff);
                 write32Mask(path == 0 ? 0x180c : 0x410c, 0x3, 0);
                 writeRfMask(path, 0x18, 0xff, bandChannel[band]);
@@ -7925,7 +8320,7 @@ void RealtekRTL8822C::runTxGapkCalibration() {
         // Linux write_gain_bb_table(): install the captured baseline for each band.
         for (UInt8 band = 0; band < 5; band++) {
             UInt32 qGainSel = band == 0 ? 0 : (band == 2 ? 2 : (band == 3 ? 3 : 4));
-            for (UInt8 path = 0; path < 2; path++) {
+            for (UInt8 path = 0; path < rfPathCount; path++) {
                 UInt32 retained = 0;
                 bool haveRetained = false;
                 write32Mask(0x1b00, 0x00000006, path);
@@ -7947,13 +8342,15 @@ void RealtekRTL8822C::runTxGapkCalibration() {
         write8(0x0522, 0xff);
         write32Mask(0x1e70, 0x0000000f, 2);
         for (UInt32 i = 0; i < 2500; i++) {
-            if (((readRfMask(0, 0x00, 0x000f0000) != 2) &&
-                 (readRfMask(1, 0x00, 0x000f0000) != 2))) break;
+            bool pathAIdle = readRfMask(0, 0x00, 0x000f0000) != 2;
+            bool pathBIdle = rfPathCount == 1 ||
+                readRfMask(1, 0x00, 0x000f0000) != 2;
+            if (pathAIdle && pathBIdle) break;
             if (i == 2499) pauseOk = false;
             IODelay(2);
         }
 
-        for (UInt8 path = 0; path < 2; path++) {
+        for (UInt8 path = 0; path < rfPathCount; path++) {
             channel[path] = (UInt8)readRfMask(path, 0x18, 0xff);
             UInt8 activeBand = channel[path] <= 14 ? 0 :
                 (channel[path] <= 64 ? 2 : (channel[path] <= 144 ? 3 : (channel[path] <= 177 ? 4 : 0xff)));
@@ -8082,7 +8479,7 @@ void RealtekRTL8822C::runTxGapkCalibration() {
         }
 
         // Linux write_tx_gain(): apply the measured 2.4 GHz offsets to both RF LUTs.
-        for (UInt8 path = 0; path < 2; path++) {
+        for (UInt8 path = 0; path < rfPathCount; path++) {
             if (!pathChannelOk[path]) continue;
             UInt8 activeBand = channel[path] <= 14 ? 0 :
                 (channel[path] <= 64 ? 2 : (channel[path] <= 144 ? 3 : 4));
@@ -8111,7 +8508,7 @@ void RealtekRTL8822C::runTxGapkCalibration() {
     }
 
     // Restore every transient BB/RF/MAC state even when H2C or report polling failed.
-    for (UInt8 path = 0; path < 2; path++)
+    for (UInt8 path = 0; path < rfPathCount; path++)
         for (UInt32 i = 0; i < sizeof(rfRegs) / sizeof(rfRegs[0]); i++)
             writeRfMask(path, rfRegs[i], 0xfffff, rfSaved[path][i]);
     for (UInt32 i = 0; i < sizeof(bbRegs) / sizeof(bbRegs[0]); i++) write32(bbRegs[i], bbSaved[i]);
@@ -8142,8 +8539,10 @@ bool RealtekRTL8822C::initPhy() {
     // REG_NCTL0 (0x1b00), REG_DPD_CTL1_S0 (0x1b08)
     write32Mask(0x1B00, 0x06, 0); // Select Path A (0)
     write32Mask(0x1B08, 1 << 7, 1); // Disable power save (set BIT_PS_EN)
-    write32Mask(0x1B00, 0x06, 1); // Select Path B (1)
-    write32Mask(0x1B08, 1 << 7, 1); // Disable power save (set BIT_PS_EN)
+    if (rfPathCount == 2) {
+        write32Mask(0x1B00, 0x06, 1); // Select Path B (1)
+        write32Mask(0x1B08, 1 << 7, 1); // Disable power save
+    }
     write32Mask(0x1B00, 0x06, 0); // Restore path select to A
 
     // Pre init
@@ -8188,10 +8587,11 @@ bool RealtekRTL8822C::initPhy() {
 
     // The generated local arrays are already normalized to their target paths.
     loadTable(rtw8822c_rf_a, sizeof(rtw8822c_rf_a) / sizeof(UInt32), 3, 0);
-    loadTable(rtw8822c_rf_b, sizeof(rtw8822c_rf_b) / sizeof(UInt32), 3, 1);
+    if (rfPathCount == 2)
+        loadTable(rtw8822c_rf_b, sizeof(rtw8822c_rf_b) / sizeof(UInt32), 3, 1);
 
     // Config TRX path
-    configTrxMode(3, 3, false);
+    configTrxMode(rfPathMask, rfPathMask, false);
 
     // DPK MAC/BB and AFE tables are calibration-only. Linux applies them only
     // after backing up normal state and restores every affected register.
@@ -8210,7 +8610,7 @@ bool RealtekRTL8822C::initPhy() {
         writeRfMask(0, 0x43, 0xF0000, therm_val);
     }
     UInt8 pg_therm_b = physEfuseMap[0x1b0];
-    if (pg_therm_b != 0xFF) {
+    if (rfPathCount == 2 && pg_therm_b != 0xFF) {
         UInt8 therm_val = (pg_therm_b >> 1) & 0x07;
         therm_val |= (pg_therm_b & 0x01) << 3;
         writeRfMask(1, 0x43, 0xF0000, therm_val);
@@ -8222,7 +8622,7 @@ bool RealtekRTL8822C::initPhy() {
         writeRfMask(0, 0x60, 0xF000, pabias_2ga & 0x0F);
     }
     UInt8 pabias_2gb = physEfuseMap[0x1d5];
-    if (pabias_2gb != 0xFF) {
+    if (rfPathCount == 2 && pabias_2gb != 0xFF) {
         writeRfMask(1, 0x60, 0xF000, pabias_2gb & 0x0F);
     }
     UInt8 pabias_5ga = physEfuseMap[0x1d8];
@@ -8230,7 +8630,7 @@ bool RealtekRTL8822C::initPhy() {
         writeRfMask(0, 0x60, 0xF0000, pabias_5ga & 0x0F);
     }
     UInt8 pabias_5gb = physEfuseMap[0x1d7];
-    if (pabias_5gb != 0xFF) {
+    if (rfPathCount == 2 && pabias_5gb != 0xFF) {
         writeRfMask(1, 0x60, 0xF0000, pabias_5gb & 0x0F);
     }
 
@@ -8257,7 +8657,7 @@ bool RealtekRTL8822C::initPhy() {
         { 0x1eb, 0x1e7, 0x1e3, 0x1df, 0x1db }
     };
     bool has5gPowerTrim = false;
-    for (UInt8 path = 0; path < 2; path++) {
+    for (UInt8 path = 0; path < rfPathCount; path++) {
         for (UInt8 i = 0; i < 5; i++) {
             UInt8 value = physEfuseMap[trim5gOffset[path][i]];
             if (value == 0xff) continue;
@@ -8267,7 +8667,7 @@ bool RealtekRTL8822C::initPhy() {
     }
     if (has2gPowerTrim || has5gPowerTrim) {
         const UInt8 linuxTrimIndex[] = { 0, 1, 2, 2, 3, 4, 5, 6, 7, 3, 4, 5, 6, 7, 7 };
-        for (UInt8 path = 0; path < 2; path++) {
+        for (UInt8 path = 0; path < rfPathCount; path++) {
             writeRfMask(path, 0xee, 1U << 19, 1);
             for (UInt8 seq = 0; seq < sizeof(linuxTrimIndex); seq++) {
                 writeRfMask(path, 0x33, 0xfffff, seq);
@@ -8298,7 +8698,8 @@ bool RealtekRTL8822C::initPhy() {
     // We simulate rtw8822c_set_channel_rf for 2.4GHz, Channel 6, 20MHz bandwidth.
 
     UInt32 rf_reg18_a = readRfMask(0, 0x18, 0xfffff);
-    UInt32 rf_reg18_b = readRfMask(1, 0x18, 0xfffff);
+    UInt32 rf_reg18_b = rfPathCount == 2 ?
+        readRfMask(1, 0x18, 0xfffff) : rf_reg18_a;
 
     char dbg_buf[64];
     snprintf(dbg_buf, sizeof(dbg_buf), "A=0x%05X B=0x%05X", (unsigned int)rf_reg18_a, (unsigned int)rf_reg18_b);
@@ -8314,11 +8715,12 @@ bool RealtekRTL8822C::initPhy() {
     writeRfMask(0, 0x3f, 0xfffff, rf_rxbb); // RF_LUTWD0
     writeRfMask(0, 0xee, 0x04, 0x00); // RF_LUTWE2
 
-    // Path B
-    writeRfMask(1, 0xee, 0x04, 0x01); // RF_LUTWE2
-    writeRfMask(1, 0x33, 0x1f, 0x12); // RF_LUTWA
-    writeRfMask(1, 0x3f, 0xfffff, rf_rxbb); // RF_LUTWD0
-    writeRfMask(1, 0xee, 0x04, 0x00); // RF_LUTWE2
+    if (rfPathCount == 2) {
+        writeRfMask(1, 0xee, 0x04, 0x01); // RF_LUTWE2
+        writeRfMask(1, 0x33, 0x1f, 0x12); // RF_LUTWA
+        writeRfMask(1, 0x3f, 0xfffff, rf_rxbb); // RF_LUTWD0
+        writeRfMask(1, 0xee, 0x04, 0x00); // RF_LUTWE2
+    }
 
     rf_reg18_a &= ~(0x10300U | 0xffU | 0x60000U | 0x3000U);
     rf_reg18_a |= 0x000000; // BAND_2G (0x00000)
@@ -8330,12 +8732,13 @@ bool RealtekRTL8822C::initPhy() {
     rf_reg18_b |= 0x000000;
     rf_reg18_b |= 6;
     rf_reg18_b |= 0x003000;
-    writeRfMask(1, 0x18, 0xfffff, rf_reg18_b);
+    if (rfPathCount == 2) writeRfMask(1, 0x18, 0xfffff, rf_reg18_b);
 
     // Enable 3-wire
     write32Mask(0x1c90, 0x100, 1);
     write32Mask(0x1830, 0x20000000, 1); // REG_ANAPAR_A, BIT_ANAPAR_UPDATE
-    write32Mask(0x4130, 0x20000000, 1); // REG_ANAPAR_B, BIT_ANAPAR_UPDATE
+    if (rfPathCount == 2)
+        write32Mask(0x4130, 0x20000000, 1); // REG_ANAPAR_B
 
     IODelay(1000);
     // ----------------------------------------------------------------------
@@ -8352,8 +8755,10 @@ bool RealtekRTL8822C::initPhy() {
     // Boot calibration is also a balanced RFK transaction.
     write32Mask(0x1B00, 0x06, 0);
     write32Mask(0x1B08, 1U << 7, 0);
-    write32Mask(0x1B00, 0x06, 1);
-    write32Mask(0x1B08, 1U << 7, 0);
+    if (rfPathCount == 2) {
+        write32Mask(0x1B00, 0x06, 1);
+        write32Mask(0x1B08, 1U << 7, 0);
+    }
     write32Mask(0x1B00, 0x06, 0);
 
     char rf0PostIqk[64];
@@ -8364,8 +8769,11 @@ bool RealtekRTL8822C::initPhy() {
 
     write32Mask(0x1b00, 0x06, 0);
     UInt32 rfkPsA = read32Mask(0x1b08, 1U << 7);
-    write32Mask(0x1b00, 0x06, 1);
-    UInt32 rfkPsB = read32Mask(0x1b08, 1U << 7);
+    UInt32 rfkPsB = 0;
+    if (rfPathCount == 2) {
+        write32Mask(0x1b00, 0x06, 1);
+        rfkPsB = read32Mask(0x1b08, 1U << 7);
+    }
     write32Mask(0x1b00, 0x06, 0);
     char phyBaseline[384];
     snprintf(phyBaseline, sizeof(phyBaseline),
@@ -8415,8 +8823,11 @@ bool RealtekRTL8822C::sendPhyDmInfo() {
     pkt32[0] = 0x01U | (0xFFU << 8) | ((UInt32)0x11U << 16);
     // Word 1: total_len[15:0]=16, seq[31:16]=h2cSeq
     pkt32[1] = 16U | ((UInt32)h2cSeq << 16);
-    // Word 2: rfe_option, rf_type=2, cut_ver=cutVersion, rx_ant=3, tx_ant=3
-    pkt32[2] = (rfeOption & 0xFFU) | (2U << 8) | ((cutVersion & 0xFFU) << 16) | (3U << 24) | (3U << 28);
+    // Linux derives RF topology from SYS_CFG1 rather than the laptop model.
+    UInt32 firmwareRfType = rfPathCount == 2 ? 2U : 0U; // RF_2T2R / RF_1T1R
+    pkt32[2] = (rfeOption & 0xFFU) | (firmwareRfType << 8) |
+               ((cutVersion & 0xFFU) << 16) |
+               ((UInt32)rfPathMask << 24) | ((UInt32)rfPathMask << 28);
     h2cSeq++;
 
     return sendH2CPacket(h2c_pkt, 32);
@@ -10164,7 +10575,7 @@ void RealtekRTL8822C::handleMgmtFrame(const UInt8* frame, UInt32 len) {
                     negotiatedRaMask = (targetChannel > 14 ? 0x00000030U : 0x00000015U) |
                                        ((UInt32)targetHtMcs0 << 12);
                 }
-                if (htNegotiated && targetHtMcs1 != 0) {
+                if (htNegotiated && rfPathCount == 2 && targetHtMcs1 != 0) {
                     negotiatedRaMask |= (UInt32)targetHtMcs1 << 20;
                     negotiatedRateId = targetChannel > 14 ? 4 : 2;
                 } else if (htNegotiated) {
@@ -10175,7 +10586,9 @@ void RealtekRTL8822C::handleMgmtFrame(const UInt8* frame, UInt32 len) {
                     vhtNegotiated = false;
                     traceEvent("assoc:peer-downgraded-ht");
                 } else if (vhtNegotiated) {
-                    const UInt16 localVhtMcsMap = fiveGTwoStreamPowerValid ? 0xfffa : 0xfffe;
+                    const UInt16 localVhtMcsMap =
+                        (rfPathCount == 2 && fiveGTwoStreamPowerValid) ?
+                            0xfffa : 0xfffe;
                     UInt32 vhtMask = 0;
                     for (UInt8 stream = 0; stream < 2; stream++) {
                         UInt8 peerCode = (UInt8)((responseVhtRxMcsMap >> (stream * 2)) & 0x03);
@@ -10668,7 +11081,9 @@ bool RealtekRTL8822C::sendAssocRequest() {
     vhtNegotiated = false;
     if (useHt) {
         const UInt8 localMcs0 = 0xff;
-        const UInt8 localMcs1 = is5GHzLink && !fiveGTwoStreamPowerValid ? 0x00 : 0xff;
+        const UInt8 localMcs1 =
+            rfPathCount == 2 && (!is5GHzLink || fiveGTwoStreamPowerValid) ?
+                0xff : 0x00;
         UInt8 negotiatedMcs0 = targetHtMcs0 & localMcs0;
         UInt8 negotiatedMcs1 = targetHtMcs1 & localMcs1;
 
@@ -10717,8 +11132,10 @@ bool RealtekRTL8822C::sendAssocRequest() {
         bool useVht = is5GHzLink && targetSupportsVht && targetSupportsWmm;
         UInt32 vhtMask = 0;
         if (useVht) {
-            const UInt16 localVhtMcsMap = fiveGTwoStreamPowerValid ? 0xfffa : 0xfffe;
-            const UInt16 localVhtHighest = fiveGTwoStreamPowerValid ? 780 : 390;
+            const bool localTwoStream =
+                rfPathCount == 2 && fiveGTwoStreamPowerValid;
+            const UInt16 localVhtMcsMap = localTwoStream ? 0xfffa : 0xfffe;
+            const UInt16 localVhtHighest = localTwoStream ? 780 : 390;
             // Match Linux RTL8822C capabilities; the operational bandwidth
             // was already selected from the AP's HT/VHT Operation elements.
             const UInt32 localVhtCap = 0x03d071b2U;

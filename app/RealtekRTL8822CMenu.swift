@@ -51,6 +51,7 @@ private enum DriverAvailability: UInt32 {
     case unsupportedHardware = 0
     case kextNotLoaded = 1
     case ready = 2
+    case initializationFailed = 3
 }
 
 private func ioReturnDescription(_ value: Int32) -> String {
@@ -292,19 +293,23 @@ private func buildWirelessNetworks(from snapshot: ScanSnapshot) -> [WirelessNetw
     }
 }
 
-#if RTW_APP_DEBUG
 @MainActor
-private final class DebugWindowController: NSWindowController {
+private final class ReportWindowController: NSWindowController {
     private let textView = NSTextView()
     private let client: DriverClient
+    private let includeDebug: Bool
+    private let refreshDriver: Bool
 
-    init(client: DriverClient) {
+    init(client: DriverClient, title: String, includeDebug: Bool,
+         refreshDriver: Bool) {
         self.client = client
+        self.includeDebug = includeDebug
+        self.refreshDriver = refreshDriver
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 820, height: 600),
             styleMask: [.titled, .closable, .resizable, .miniaturizable],
             backing: .buffered, defer: false)
-        window.title = "Realtek RTL8822C Debug Info"
+        window.title = title
         window.center()
         super.init(window: window)
         buildContent()
@@ -355,8 +360,8 @@ private final class DebugWindowController: NSWindowController {
     }
 
     @objc private func refresh() {
-        _ = client.send(.updateStatus)
-        textView.string = client.report(includeDebug: true)
+        if refreshDriver { _ = client.send(.updateStatus) }
+        textView.string = client.report(includeDebug: includeDebug)
     }
 
     @objc private func copyReport() {
@@ -364,7 +369,6 @@ private final class DebugWindowController: NSWindowController {
         NSPasteboard.general.setString(textView.string, forType: .string)
     }
 }
-#endif
 
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
@@ -397,6 +401,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var scanMenuItem: NSMenuItem?
     private var networkMenuItems: [NSMenuItem] = []
     private var driverAvailability: DriverAvailability = .unsupportedHardware
+    private var debugDriver = false
+    private var failedDebugDriver = false
     private var linkStateInitialized = false
     private var previousWiFiStatus = ""
     private var previousConnectedSSID = ""
@@ -408,9 +414,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var pendingNotification: (key: String, title: String, body: String)?
     private var notificationKeysInFlight: Set<String> = []
     private var notificationDeliveryError: String?
-#if RTW_APP_DEBUG
-    private var debugWindow: DebugWindowController?
-#endif
+    private var debugWindow: ReportWindowController?
+    private var failInfoWindow: ReportWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = notification
@@ -466,6 +471,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func refreshStatus() {
         driverAvailability = DriverAvailability(rawValue: RTWClientGetAvailability()) ??
             .unsupportedHardware
+        let buildConfiguration: String?
+        if driverAvailability == .ready {
+            buildConfiguration = client.property("BuildConfiguration") ??
+                client.property("RTL8822CBuildConfiguration")
+        } else {
+            buildConfiguration = client.property("RTL8822CBuildConfiguration") ??
+                client.property("BuildConfiguration")
+        }
+        debugDriver = buildConfiguration?.caseInsensitiveCompare("Debug") ==
+            .orderedSame
+        failedDebugDriver = driverAvailability == .initializationFailed && debugDriver
         guard driverAvailability == .ready else {
             wifiEnabled = false
             connectedSSID = ""
@@ -474,9 +490,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             scanSnapshotLoadGeneration &+= 1
             scanSnapshotLoadPending = false
             connectionPending = false
-            statusMessage = driverAvailability == .kextNotLoaded ?
-                "RTL8822C kext is not loaded" :
-                "RTL8822C hardware is not supported or was not detected"
+            switch driverAvailability {
+            case .initializationFailed:
+                let stage = client.property("RTL8822CStartStage") ?? "unknown stage"
+                let failure = client.property("RTL8822CStartFailure") ??
+                    "unspecified hardware initialization error"
+                statusMessage = "RTL8822C initialization failed at \(stage): \(failure)"
+            case .kextNotLoaded:
+                statusMessage = "RTL8822C kext is not loaded"
+            default:
+                statusMessage = "RTL8822C hardware is not supported or was not detected"
+            }
             statusItem.button?.image = NSImage(
                 systemSymbolName: "wifi.exclamationmark",
                 accessibilityDescription: statusMessage)
@@ -572,13 +596,33 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                                     keyEquivalent: "")
             status.isEnabled = false
             menu.addItem(status)
-            let detail = NSMenuItem(
-                title: driverAvailability == .kextNotLoaded ?
-                    "Compatible RTL8822CE hardware was detected." :
-                    "A supported Realtek RTL8822CE (10ec:c822) was not found.",
-                action: nil, keyEquivalent: "")
+            let detailText: String
+            switch driverAvailability {
+            case .initializationFailed:
+                detailText = "Compatibility details are available in the driver report."
+            case .kextNotLoaded:
+                detailText = "Compatible RTL8822CE hardware was detected."
+            default:
+                detailText = "A supported Realtek RTL8822CE (10ec:c822) was not found."
+            }
+            let detail = NSMenuItem(title: detailText, action: nil,
+                                    keyEquivalent: "")
             detail.isEnabled = false
             menu.addItem(detail)
+            if driverAvailability == .initializationFailed && failedDebugDriver {
+                let failInfo = NSMenuItem(
+                    title: "Fail Info…", action: #selector(showFailInfo),
+                    keyEquivalent: "")
+                failInfo.target = self
+                menu.addItem(failInfo)
+            } else if driverAvailability == .initializationFailed {
+                let report = NSMenuItem(
+                    title: "Copy Compatibility Report",
+                    action: #selector(copyCompatibilityReport),
+                    keyEquivalent: "")
+                report.target = self
+                menu.addItem(report)
+            }
             menu.addItem(.separator())
             let download = NSMenuItem(title: "Download RealtekRTL8822C…",
                                       action: #selector(openProjectReleases),
@@ -740,13 +784,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         menu.addItem(launchAtLogin)
 
-#if RTW_APP_DEBUG
-        let debug = NSMenuItem(title: "Debug Info…",
-                               action: #selector(showDebugInfo),
-                               keyEquivalent: "d")
-        debug.target = self
-        menu.addItem(debug)
-#endif
+        if driverAvailability == .ready && debugDriver {
+            let debug = NSMenuItem(title: "Debug Info…",
+                                   action: #selector(showDebugInfo),
+                                   keyEquivalent: "d")
+            debug.target = self
+            menu.addItem(debug)
+        }
 
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit Realtek RTL8822C Wi-Fi",
@@ -1144,6 +1188,27 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
     }
 
+    @objc private func copyCompatibilityReport() {
+        let report = client.report(includeDebug: false)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(report, forType: .string)
+    }
+
+    @objc private func showFailInfo() {
+        guard driverAvailability == .initializationFailed,
+              failedDebugDriver else { return }
+        if failInfoWindow == nil {
+            failInfoWindow = ReportWindowController(
+                client: client,
+                title: "Realtek RTL8822C Fail Info",
+                includeDebug: true,
+                refreshDriver: false)
+        }
+        failInfoWindow?.showWindow(nil)
+        failInfoWindow?.window?.makeKeyAndOrderFront(nil)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+
     private func requestPassword(for ssid: String) -> String? {
         let alert = NSAlert()
         alert.messageText = "Enter the password for “\(ssid)”"
@@ -1159,15 +1224,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         return field.stringValue
     }
 
-#if RTW_APP_DEBUG
     @objc private func showDebugInfo() {
-        if debugWindow == nil { debugWindow = DebugWindowController(client: client) }
+        guard driverAvailability == .ready, debugDriver else { return }
+        if debugWindow == nil {
+            debugWindow = ReportWindowController(
+                client: client,
+                title: "Realtek RTL8822C Debug Info",
+                includeDebug: true,
+                refreshDriver: true)
+        }
         debugWindow?.showWindow(nil)
         debugWindow?.window?.makeKeyAndOrderFront(nil)
         NSApplication.shared.activate(ignoringOtherApps: true)
     }
-
-#endif
 
     @objc private func quitApplication() { NSApplication.shared.terminate(nil) }
 

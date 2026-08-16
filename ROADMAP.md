@@ -48,26 +48,36 @@ Version 0.0.3 focuses on scan/connection stability and compatibility:
 - Debug and log-free Release hardware validation, including scan, WPA2,
   sustained traffic, interface control, and sleep/wake.
 
-## v0.0.4 - planned
+## v0.0.4 - released
 
-Version 0.0.4 is intended to expand network functionality, led by DFS support:
+Version 0.0.4 expands hardware and system compatibility without changing the
+established channel policy:
 
-- introduce an explicit regulatory-domain model;
-- validate channel 12/13 policy independently from DFS;
-- port and validate RTL8822C TX power, trims, bandwidth, and primary-channel
-  programming for channels 52-144;
-- implement DFS availability checks, CAC, radar detection, channel evacuation,
-  and no-transmit handling during CAC;
-- expand controlled WPA2/VHT/Block Ack/lifecycle coverage across the newly
-  authorized channel set;
-- evaluate additional security and network capabilities only behind separate
-  implementation and hardware-validation gates.
+- persist a bounded initialization result, stage, PCI identity, silicon cut,
+  RF-path topology, RFE option, and failure reason on the PCI provider when the
+  controller cannot finish `start()`;
+- expose a deeper Debug-only startup trace, PCI/chip snapshot, and selected
+  EFUSE/RFE evidence without relying on unavailable kernel logs;
+- distinguish unsupported hardware, an unloaded kext, a failed initialization,
+  and a ready controller in the CLI and menu application;
+- remove subsystem, PCI revision, 2T2R, cut-D-only, and reference-board PCIe
+  policy assumptions from eligibility and initialization paths;
+- follow Linux RTL8822C handling for cut D+, 1T1R/2T2R topology, RFE 5, RFE 6,
+  and restoration of host PCIe policy;
+- retain a start-only, bounded Release report and compile deeper diagnostics out
+  of Release so the normal packet path has no additional reporting cost;
+- retain macOS 12 deployment targets for Debug kext and userspace, with macOS
+  12-14 support remaining experimental until separate hardware runs pass, and
+  use the pinned backward-compatible MacKernelSDK kmod startup objects;
 
-No DFS channel will be enabled for transmission merely because it can be
-detected passively.
+The reference macOS 15 cut-D system completed the release acceptance matrix.
+macOS 12-14 and additional RTL8822CE boards remain experimental until each
+configuration completes the same matrix independently.
 
 ## Later work
 
+- Implement DFS regulatory-domain selection, CAC, radar detection, evacuation,
+  and guarded transmit support as a separate evidence-gated milestone.
 - Expand the RTL8822CE board, AP, macOS, bandwidth, interrupt, and sleep/wake
   matrix.
 - Add WPA3/SAE, Enterprise authentication, and PMF in separate milestones.

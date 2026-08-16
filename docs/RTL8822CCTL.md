@@ -19,12 +19,14 @@ rtl8822cctl on
 rtl8822cctl off
 ```
 
-With the v0.0.3 kext, commands use the versioned RTL8822C local-user
+With the v0.0.4 kext, commands use the versioned RTL8822C local-user
 client and do not require root privileges. The user client accepts only status,
 structured scan snapshots, scan, connect, cancellation, disconnect, and
 interface-state commands; it exposes no DMA memory or register access. The
-`availability` command distinguishes a loaded driver from compatible PCI
-hardware without a loaded service and unsupported hardware. A command failure
+`availability` distinguishes a ready driver, compatible PCI hardware without a
+loaded service, a recorded initialization failure, and unsupported hardware.
+After a failed `start()`, `report` reads the bounded postmortem from the
+surviving PCI provider even though no controller service exists. A command failure
 against an older kext normally means the required user-client protocol is
 unavailable.
 
@@ -57,14 +59,23 @@ should not be used for ordinary interactive operation.
 authentication, association, or WPA negotiation. The ordinary report exposes a
 machine-readable connection-attempt ID, phase, result, and failure reason.
 
-`report` also includes `DriverBuildTargetMacOS`. The Debug kext currently
-reports the experimental macOS 12 target used for compatibility testing; this
-has not been validated on macOS 12-14 and does not establish support for those
-systems. Release retains the hardware-confirmed macOS 15.5 target.
+`report` also includes the build target and start result/stage, PCI identity,
+silicon cut, RF-path count, RFE option, and failure reason. Debug additionally
+includes a stage trace and selected PCI, chip, EFUSE, and RFE evidence. The
+Debug kext reports the experimental macOS 12 target used for compatibility
+testing and links the pinned MacKernelSDK startup objects. This has not been
+validated on macOS 12-14 and does not establish support for those systems.
+Release retains the hardware-confirmed macOS 15.5 target.
 
 Before sharing `rtl8822cctl report`, redact SSIDs, BSSIDs, local IP addresses, and
 other device identifiers. The report must never expose raw PMK/PTK/GTK bytes;
 that is a release-blocking defect.
 
-Release intentionally has no diagnostic revision property: absence of all
-`Debug_*` fields is the expected user-facing behavior, not a reporting failure.
+Release intentionally has no diagnostic revision or `RTL8822CDebug*` property:
+absence of those deep fields is expected, not a reporting failure. Its bounded
+startup properties are written only during initialization and do not affect the
+packet path.
+
+The v0.0.4 Debug driver archive includes the matching Debug `rtl8822cctl` so an
+external tester can run `rtl8822cctl availability` and `rtl8822cctl report`
+without building the utility locally.

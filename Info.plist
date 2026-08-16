@@ -28,14 +28,10 @@
 			<string>RealtekRTL8822C</string>
 			<key>IOPCIMatch</key>
 			<string>0xc82210ec 0xC82210EC</string>
-			<key>IONameMatch</key>
-			<array>
-				<string>pci10ec,c822</string>
-			</array>
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
 			<key>IOProbeScore</key>
-			<integer>2000</integer>
+			<integer>5000</integer>
 		</dict>
 	</dict>
 	<key>OSBundleLibraries</key>

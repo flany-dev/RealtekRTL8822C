@@ -29,6 +29,14 @@ grep -Fxq 'docs/internal/' .gitignore || {
     exit 1
 }
 
+tracked_private="$(git ls-files | grep -E \
+    '(^|/)(AGENTS\.md|\.DS_Store)$|^docs/internal/|^build/' || true)"
+if test -n "$tracked_private"; then
+    echo "documentation privacy check failed: private path is tracked" >&2
+    echo "$tracked_private" >&2
+    exit 1
+fi
+
 find . \
     \( -path './.git' -o -path './build' -o -path './docs/internal' \) -prune \
     -o -path './AGENTS.md' -prune \

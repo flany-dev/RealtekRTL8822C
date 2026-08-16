@@ -1,10 +1,12 @@
-# v0.0.3 Hardware Acceptance
+# v0.0.4 Hardware Acceptance
 
-The reference RTL8822CE cut D system has completed the v0.0.3 functional run,
+The reference RTL8822CE cut D system completed the v0.0.4 functional run,
 including the menu application, non-root controls, Release-profile traffic,
 structured scanning, hidden-network discovery, reconnect, interface lifecycle,
 and sleep/wake testing. This document is the repeatable qualification procedure
-for future builds and additional hardware.
+for v0.0.4 and additional hardware. The release qualification is complete on
+the reference macOS 15 system; additional macOS versions and boards remain
+experimental until they complete this procedure independently.
 
 Run this procedure on the exact Debug and Release artifacts intended for the
 release. Record artifact hashes, macOS version, OpenCore version, PCI ID, chip
@@ -40,9 +42,32 @@ Debug acceptance:
 Complete at least ten cold boots. Every boot must scan and connect without a
 firmware, calibration, DMA, or interface failure.
 
+On every machine record:
+
+```sh
+"$RTL8822CCTL" availability
+"$RTL8822CCTL" report
+ioreg -c IOPCIDevice -r -k vendor-id
+```
+
+If initialization fails, `availability` must explicitly report that failure,
+and `report` must still contain `RTL8822CStartResult`, the last stage, PCI and
+subsystem identity, chip cut/topology when BAR access succeeded, and the stable
+failure reason. Debug must additionally contain `RTL8822CDebugStartTrace` and
+the deepest PCI/chip/EFUSE snapshot reached. A generic "kext not loaded" result
+for this case blocks the release.
+
+Also record `RTL8822CPCIELinkSpeed`, `RTL8822CPCIELinkWidth`,
+`RTL8822CPCIPhyConfig`, and `RTL8822CPCIeLinkConfig`. The PHY/link values may
+report `no-matching-parameters` or `nonfatal-warning`; these describe the
+optional compatibility layer and are not startup success criteria. A fatal
+start failure must still be reported through `RTL8822CStartResult` and its
+stable failure stage.
+
 The Debug macOS 12 deployment target is an experimental compatibility-testing
-option only. It has been run on the macOS 15 reference machine, but not on
-macOS 12-14, and the current SDK supplies newer kmod startup objects. Do not
+option only. It links the pinned backward-compatible MacKernelSDK kmod startup
+objects, but has been run on the macOS 15 reference machine, not macOS 12-14.
+macOS 14 is the first required secondary-system target. Do not
 record an older macOS version as supported until it completes this entire
 procedure independently.
 
@@ -62,7 +87,7 @@ receive-only rows must remain visible but unavailable for connection.
 
 Validate 20 MHz, 40 MHz, and 80 MHz operation on controlled access points.
 Channel 165 must remain 20 MHz. Do not test or enable DFS transmission; that
-requires the regulatory, CAC, radar, and evacuation work planned for v0.0.4.
+requires a later independent regulatory, CAC, radar, and evacuation milestone.
 
 Reject any result where the selected primary channel, center channel,
 bandwidth, RF state, or transmit-power table does not match the access point.
@@ -93,7 +118,7 @@ Test a router and an Android hotspot using `RealtekRTL8822CMenu.app`:
     failure, including a queued connection.
 
 Repeat the connection through `rtl8822cctl connect` as a CLI fallback. Neither
-the application nor v0.0.3 CLI commands should require `sudo`.
+the application nor v0.0.4 CLI commands should require `sudo`.
 
 Reject stale credentials, stale CAM entries, replay failures, permanent queue
 stalls, TXDMA faults, or an inability to reconnect.

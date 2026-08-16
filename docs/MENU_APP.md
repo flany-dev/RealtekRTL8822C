@@ -1,6 +1,6 @@
 # RealtekRTL8822CMenu
 
-`RealtekRTL8822CMenu.app` is the v0.0.3 native macOS menu bar frontend for the
+`RealtekRTL8822CMenu.app` is the v0.0.4 native macOS menu bar frontend for the
 RealtekRTL8822C driver. It provides a familiar Wi-Fi control surface without
 claiming integration with Apple's private Wi-Fi framework.
 
@@ -21,6 +21,8 @@ claiming integration with Apple's private Wi-Fi framework.
 - disconnect and Wi-Fi on/off controls;
 - native **Launch at Login** control managed by macOS `SMAppService`;
 - Debug-only diagnostic window with refresh and copy actions.
+- a distinct initialization-failed state with a copyable compatibility report,
+  available even after the controller service has disappeared.
 
 The app has no Dock icon and remains available through the menu bar. Quit it
 from the final menu item.
@@ -66,7 +68,7 @@ than the currently connected AP.
 
 ## Driver requirement
 
-The app requires the matching v0.0.3 kext. It communicates through a
+The app requires the matching v0.0.4 kext. It communicates through a
 fixed-size, versioned `IOUserClient` available only to the active local user.
 No privileged helper, `sudo`, shell command, arbitrary registry-property write,
 DMA mapping, or register-control method is exposed.
@@ -91,19 +93,23 @@ Enterprise authentication, and required PMF remain unsupported.
 
 ## Debug and Release
 
-The Debug app adds **Debug Info…**, which displays the ordinary operational
-properties plus the kext's `Debug_*` diagnostics. The Release app omits this
-menu item and does not embed the diagnostic property names. Binary checks
-enforce the separation.
+The distributed app is one binary. When the attached kext reports
+`BuildConfiguration=Debug`, it adds **Debug Info…**, which displays ordinary
+operational properties plus `Debug_*` and deep startup diagnostics. If that
+Debug kext fails before registering its controller, the same app instead shows
+**Fail Info…** and reads the saved `RTL8822CDebug*` startup properties directly
+from the PCI provider. Neither window requires a surviving controller service.
+Release kexts never publish those diagnostic properties, so both buttons remain
+hidden for a Release kext; a failed Release start exposes only **Copy
+Compatibility Report** with bounded public fields.
 
 ## Build output
 
 ```text
-build/Debug/RealtekRTL8822CMenu.app
-build/Release/RealtekRTL8822CMenu.app
+build/app/RealtekRTL8822CMenu.app
 ```
 
-The v0.0.3 GitHub Release asset `RealtekRTL8822CMenu-0.0.3.zip` contains only
+The v0.0.4 GitHub Release asset `RealtekRTL8822CMenu-0.0.4.zip` contains only
 the Release application bundle. Install the matching Release or Debug kext
 separately; the standalone application archive does not contain a driver.
 

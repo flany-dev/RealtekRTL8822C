@@ -66,17 +66,31 @@ if unzip -Z1 "$archive" | grep -Eq '(^|/)AGENTS\.md$|/docs/internal/'; then
     echo "Release package contains private project memory" >&2
     exit 1
 fi
-for kext_archive in "$release_kext_archive" "$debug_kext_archive"; do
-    unzip -tq "$kext_archive" >/dev/null
-    unzip -Z1 "$kext_archive" | grep -Fxq 'RealtekRTL8822C.kext/' || {
-        echo "Kext archive has no top-level RealtekRTL8822C.kext: $kext_archive" >&2
-        exit 1
-    }
-    if unzip -Z1 "$kext_archive" | grep -Evq '^RealtekRTL8822C\.kext(/|$)'; then
-        echo "Kext archive contains an unexpected top-level entry: $kext_archive" >&2
-        exit 1
-    fi
-done
+unzip -tq "$release_kext_archive" >/dev/null
+unzip -Z1 "$release_kext_archive" | grep -Fxq 'RealtekRTL8822C.kext/' || {
+    echo "Release kext archive has no top-level RealtekRTL8822C.kext" >&2
+    exit 1
+}
+if unzip -Z1 "$release_kext_archive" | grep -Evq '^RealtekRTL8822C\.kext(/|$)'; then
+    echo "Release kext archive contains an unexpected top-level entry" >&2
+    exit 1
+fi
+debug_root="RealtekRTL8822C-$(cat VERSION)-Debug"
+unzip -tq "$debug_kext_archive" >/dev/null
+unzip -Z1 "$debug_kext_archive" |
+    grep -Fxq "$debug_root/RealtekRTL8822C.kext/" || {
+    echo "Debug archive has no diagnostic kext" >&2
+    exit 1
+}
+unzip -Z1 "$debug_kext_archive" | grep -Fxq "$debug_root/rtl8822cctl" || {
+    echo "Debug archive has no diagnostic rtl8822cctl" >&2
+    exit 1
+}
+if unzip -Z1 "$debug_kext_archive" |
+    grep -Evq "^$debug_root(/?$|/RealtekRTL8822C\.kext(/|$)|/rtl8822cctl$)"; then
+    echo "Debug archive contains an unexpected entry" >&2
+    exit 1
+fi
 unzip -tq "$menu_app_archive" >/dev/null
 unzip -Z1 "$menu_app_archive" | grep -Fxq 'RealtekRTL8822CMenu.app/' || {
     echo "Menu app archive has no top-level RealtekRTL8822CMenu.app" >&2

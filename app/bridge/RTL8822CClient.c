@@ -12,10 +12,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef RTW_APP_DEBUG
-#define RTW_APP_DEBUG 0
-#endif
-
 static io_service_t RTWCopyService(void) {
     CFMutableDictionaryRef matching = IOServiceMatching("RealtekRTL8822C");
     if (!matching) return IO_OBJECT_NULL;
@@ -40,20 +36,26 @@ static bool RTWCopyPCIIdentifier(io_registry_entry_t entry, CFStringRef key,
     return copied;
 }
 
-uint32_t RTWClientGetAvailability(void) {
-    io_service_t driver = RTWCopyService();
-    if (driver) {
-        IOObjectRelease(driver);
-        return 2U;
-    }
+static bool RTWCopyStringPropertyEquals(io_registry_entry_t entry,
+                                        CFStringRef key,
+                                        CFStringRef expected) {
+    CFTypeRef value = IORegistryEntryCreateCFProperty(
+        entry, key, kCFAllocatorDefault, 0);
+    bool equal = value && CFGetTypeID(value) == CFStringGetTypeID() &&
+        CFStringCompare((CFStringRef)value, expected, 0) == kCFCompareEqualTo;
+    if (value) CFRelease(value);
+    return equal;
+}
 
+static io_service_t RTWCopyCompatiblePCIDevice(void) {
     CFMutableDictionaryRef matching = IOServiceMatching("IOPCIDevice");
-    if (!matching) return 0U;
+    if (!matching) return IO_OBJECT_NULL;
     io_iterator_t iterator = IO_OBJECT_NULL;
     if (IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) !=
-        kIOReturnSuccess) return 0U;
+        kIOReturnSuccess) return IO_OBJECT_NULL;
 
-    bool compatible = false;
+    io_service_t compatible = IO_OBJECT_NULL;
+    bool compatibleHasDiagnostics = false;
     io_registry_entry_t entry;
     while ((entry = IOIteratorNext(iterator)) != IO_OBJECT_NULL) {
         uint32_t vendor = 0;
@@ -61,14 +63,44 @@ uint32_t RTWClientGetAvailability(void) {
         if (RTWCopyPCIIdentifier(entry, CFSTR("vendor-id"), &vendor) &&
             RTWCopyPCIIdentifier(entry, CFSTR("device-id"), &device) &&
             (vendor & 0xffffU) == 0x10ecU && (device & 0xffffU) == 0xc822U) {
-            compatible = true;
-            IOObjectRelease(entry);
-            break;
+            bool failed = RTWCopyStringPropertyEquals(
+                entry, CFSTR("RTL8822CStartResult"), CFSTR("failed"));
+            CFTypeRef startResult = IORegistryEntryCreateCFProperty(
+                entry, CFSTR("RTL8822CStartResult"), kCFAllocatorDefault, 0);
+            bool hasDiagnostics = startResult != NULL;
+            if (startResult) CFRelease(startResult);
+            if (failed || !compatible ||
+                (hasDiagnostics && !compatibleHasDiagnostics)) {
+                if (compatible) IOObjectRelease(compatible);
+                compatible = entry;
+                compatibleHasDiagnostics = hasDiagnostics;
+                if (failed) break;
+                continue;
+            }
         }
         IOObjectRelease(entry);
     }
     IOObjectRelease(iterator);
-    return compatible ? 1U : 0U;
+    return compatible;
+}
+
+uint32_t RTWClientGetAvailability(void) {
+    io_service_t driver = RTWCopyService();
+    if (driver) {
+        IOObjectRelease(driver);
+        return 2U;
+    }
+
+    io_service_t compatible = RTWCopyCompatiblePCIDevice();
+    if (!compatible) return 0U;
+    CFTypeRef result = IORegistryEntryCreateCFProperty(
+        compatible, CFSTR("RTL8822CStartResult"), kCFAllocatorDefault, 0);
+    IOObjectRelease(compatible);
+    bool failed = result && CFGetTypeID(result) == CFStringGetTypeID() &&
+        CFStringCompare((CFStringRef)result, CFSTR("failed"), 0) ==
+            kCFCompareEqualTo;
+    if (result) CFRelease(result);
+    return failed ? 3U : 1U;
 }
 
 static void RTWSecureZero(void* pointer, size_t size) {
@@ -210,7 +242,9 @@ int32_t RTWClientCopyProperty(const char* key, char* output,
     if (!key || !output || outputCapacity == 0) return kIOReturnBadArgument;
     output[0] = '\0';
 
+    bool providerProperty = strncmp(key, "RTL8822C", 8) == 0;
     io_service_t service = RTWCopyService();
+    if (!service && providerProperty) service = RTWCopyCompatiblePCIDevice();
     if (!service) return kIOReturnNotFound;
     CFStringRef propertyKey = CFStringCreateWithCString(
         kCFAllocatorDefault, key, kCFStringEncodingUTF8);
@@ -220,8 +254,16 @@ int32_t RTWClientCopyProperty(const char* key, char* output,
     }
     CFTypeRef value = IORegistryEntryCreateCFProperty(
         service, propertyKey, kCFAllocatorDefault, 0);
-    CFRelease(propertyKey);
     IOObjectRelease(service);
+    if (!value && providerProperty) {
+        service = RTWCopyCompatiblePCIDevice();
+        if (service) {
+            value = IORegistryEntryCreateCFProperty(
+                service, propertyKey, kCFAllocatorDefault, 0);
+            IOObjectRelease(service);
+        }
+    }
+    CFRelease(propertyKey);
     if (!value) return kIOReturnNotFound;
 
     bool copied = RTWCopyCFValueString(value, output, outputCapacity);
@@ -239,18 +281,42 @@ static bool RTWAppend(char* output, size_t outputCapacity, size_t* used,
     return true;
 }
 
+static void RTWMergeMissingProperty(const void* key, const void* value,
+                                    void* context) {
+    CFMutableDictionaryRef target = (CFMutableDictionaryRef)context;
+    if (!CFDictionaryContainsKey(target, key))
+        CFDictionarySetValue(target, key, value);
+}
+
 int32_t RTWClientCopyReport(char* output, size_t outputCapacity,
                             uint32_t includeDebug) {
     if (!output || outputCapacity == 0) return kIOReturnBadArgument;
     output[0] = '\0';
 
     io_service_t service = RTWCopyService();
+    bool controllerService = service != IO_OBJECT_NULL;
+    if (!service) service = RTWCopyCompatiblePCIDevice();
     if (!service) return kIOReturnNotFound;
     CFMutableDictionaryRef properties = NULL;
     kern_return_t result = IORegistryEntryCreateCFProperties(
         service, &properties, kCFAllocatorDefault, 0);
     IOObjectRelease(service);
     if (result != kIOReturnSuccess || !properties) return result;
+
+    if (includeDebug && controllerService) {
+        io_service_t provider = RTWCopyCompatiblePCIDevice();
+        if (provider) {
+            CFMutableDictionaryRef providerProperties = NULL;
+            kern_return_t providerResult = IORegistryEntryCreateCFProperties(
+                provider, &providerProperties, kCFAllocatorDefault, 0);
+            IOObjectRelease(provider);
+            if (providerResult == kIOReturnSuccess && providerProperties) {
+                CFDictionaryApplyFunction(providerProperties,
+                                          RTWMergeMissingProperty, properties);
+                CFRelease(providerProperties);
+            }
+        }
+    }
 
     CFIndex count = CFDictionaryGetCount(properties);
     const void** keys = (const void**)calloc((size_t)count, sizeof(void*));
@@ -270,12 +336,9 @@ int32_t RTWClientCopyReport(char* output, size_t outputCapacity,
         char value[8192];
         if (!CFStringGetCString((CFStringRef)keys[index], key, sizeof(key),
                                 kCFStringEncodingUTF8)) continue;
-#if RTW_APP_DEBUG
-        bool isDebug = strncmp(key, "Debug_", 6) == 0;
-#else
-        bool isDebug = false;
-        (void)includeDebug;
-#endif
+        bool isDebug = strncmp(key, "RTL8822CDebug",
+                               sizeof("RTL8822CDebug") - 1) == 0;
+        isDebug = isDebug || strncmp(key, "Debug_", 6) == 0;
         bool isPublic = strcmp(key, "DriverVersion") == 0 ||
                         strcmp(key, "BuildConfiguration") == 0 ||
                         strcmp(key, "DriverBuildTargetMacOS") == 0 ||
@@ -299,7 +362,27 @@ int32_t RTWClientCopyReport(char* output, size_t outputCapacity,
                         strcmp(key, "LinkEventSSID") == 0 ||
                         strcmp(key, "LinkEventReason") == 0 ||
                         strcmp(key, "ConnectedScanState") == 0 ||
-                        strcmp(key, "ScanResults") == 0;
+                        strcmp(key, "ScanResults") == 0 ||
+                        strcmp(key, "RTL8822CStartResult") == 0 ||
+                        strcmp(key, "RTL8822CStartStage") == 0 ||
+                        strcmp(key, "RTL8822CStartStageCode") == 0 ||
+                        strcmp(key, "RTL8822CStartFailure") == 0 ||
+                        strcmp(key, "RTL8822CDriverVersion") == 0 ||
+                        strcmp(key, "RTL8822CBuildConfiguration") == 0 ||
+                        strcmp(key, "RTL8822CBuildTargetMacOS") == 0 ||
+                        strcmp(key, "RTL8822CPCIVendor") == 0 ||
+                        strcmp(key, "RTL8822CPCIDevice") == 0 ||
+                        strcmp(key, "RTL8822CPCIRevision") == 0 ||
+                        strcmp(key, "RTL8822CPCISubsystemVendor") == 0 ||
+                        strcmp(key, "RTL8822CPCISubsystemDevice") == 0 ||
+                        strcmp(key, "RTL8822CChipVersion") == 0 ||
+                        strcmp(key, "RTL8822CChipCut") == 0 ||
+                        strcmp(key, "RTL8822CRFPathCount") == 0 ||
+                        strcmp(key, "RTL8822CRFEOption") == 0 ||
+                        strcmp(key, "RTL8822CPCIELinkSpeed") == 0 ||
+                        strcmp(key, "RTL8822CPCIELinkWidth") == 0 ||
+                        strcmp(key, "RTL8822CPCIPhyConfig") == 0 ||
+                        strcmp(key, "RTL8822CPCIeLinkConfig") == 0;
         if ((!includeDebug || !isDebug) && !isPublic) continue;
         if (!RTWCopyCFValueString(values[index], value, sizeof(value))) continue;
 

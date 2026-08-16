@@ -188,7 +188,7 @@ format-check:
 dma-cache-policy-check:
 	sh scripts/check_dma_cache_policy.sh
 
-compatibility-check: debug
+compatibility-check: debug app
 	sh scripts/check_compatibility_surface.sh
 
 release-surface-check:

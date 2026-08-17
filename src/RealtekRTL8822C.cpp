@@ -123,7 +123,9 @@ static int rtwHexValue(char c) {
 static const UInt32 kRtwHimr0 = 0x000004fd;
 static const UInt32 kRtwHimr1 = 0x00000a00;
 static const UInt32 kRtwHimr3 = 0x00010000;
-static const UInt32 kRtwHotDiagnosticMask = RTW_DEBUG ? 0x000003ffU : 0x00001fffU;
+#if RTW_DEBUG
+static const UInt32 kRtwHotDiagnosticMask = 0x000003ffU;
+#endif
 // Diagnostic baseline: restore the last profile that sustained normal
 // downlink throughput before the v54/v55 RX experiments. Stage timing below
 // will determine which work must move out of the interrupt work loop.
@@ -294,33 +296,6 @@ private:
     UInt32 debugBeqLastPsbLen;
     UInt32 debugBeqFaults;
     UInt32 debugBeqRecoveries;
-
-    // BKQ DMA
-    IOBufferMemoryDescriptor* bkqDesc;
-    IODMACommand* bkqDmaCmd;
-    addr64_t bkqPhysAddr;
-    IOBufferMemoryDescriptor* bkqPayloadDesc;
-    IODMACommand* bkqPayloadDmaCmd;
-    addr64_t bkqPayloadPhysAddr;
-    UInt32 bkqWp;
-
-    // VIQ DMA
-    IOBufferMemoryDescriptor* viqDesc;
-    IODMACommand* viqDmaCmd;
-    addr64_t viqPhysAddr;
-    IOBufferMemoryDescriptor* viqPayloadDesc;
-    IODMACommand* viqPayloadDmaCmd;
-    addr64_t viqPayloadPhysAddr;
-    UInt32 viqWp;
-
-    // VOQ DMA
-    IOBufferMemoryDescriptor* voqDesc;
-    IODMACommand* voqDmaCmd;
-    addr64_t voqPhysAddr;
-    IOBufferMemoryDescriptor* voqPayloadDesc;
-    IODMACommand* voqPayloadDmaCmd;
-    addr64_t voqPayloadPhysAddr;
-    UInt32 voqWp;
 
     // MGMTQ DMA
     IOBufferMemoryDescriptor* mgmtDesc;
@@ -628,7 +603,9 @@ private:
     void publishSignalStrength();
     bool setupRxPacketPool();
     void teardownRxPacketPool();
-    void refillRxPacketPool(UInt32 budget);
+    int refillRxPacketPool(UInt32 budget);
+    void publishRxPacketPoolSetup(const char* status, UInt32 ready,
+                                  UInt32 attempts);
     mbuf_t takeRxPacket();
     void rxPacketPoolTimerFired(OSObject* owner, IOTimerEventSource* sender);
 
@@ -862,6 +839,11 @@ private:
     UInt32 debugRxPacketPoolRefilled;
     UInt32 debugRxPacketPoolAllocFailures;
     UInt32 debugRxPacketPoolBatchCalls;
+    SInt32 rxPacketPoolLastError;
+    UInt32 rxPacketPoolLastRequested;
+    UInt32 rxPacketPoolLastAllocated;
+    UInt32 rxPacketPoolSmallestBatch;
+    bool rxPacketPoolIndividualFallback;
     bool rxPollActive;
     UInt32 debugRxPollCalls;
     UInt32 debugRxPollPackets;
@@ -1274,6 +1256,11 @@ bool RealtekRTL8822C::init(OSDictionary* dictionary) {
     debugRxPacketPoolRefilled = 0;
     debugRxPacketPoolAllocFailures = 0;
     debugRxPacketPoolBatchCalls = 0;
+    rxPacketPoolLastError = 0;
+    rxPacketPoolLastRequested = 0;
+    rxPacketPoolLastAllocated = 0;
+    rxPacketPoolSmallestBatch = 0;
+    rxPacketPoolIndividualFallback = false;
     debugBeqLastSlot = 0; debugBeqLastWifiLen = 0; debugBeqLastPsbLen = 0;
     debugBeqFaults = 0; debugBeqRecoveries = 0;
     customScanResultsCount = 0;
@@ -1408,9 +1395,6 @@ bool RealtekRTL8822C::init(OSDictionary* dictionary) {
     calibratedChannel = 0;
     calibratedBandwidth = 0;
     mgmtDesc = nullptr; mgmtDmaCmd = nullptr; mgmtPayloadDesc = nullptr; mgmtPayloadDmaCmd = nullptr; mgmtWp = 0;
-    bkqDesc = nullptr; bkqDmaCmd = nullptr; bkqPayloadDesc = nullptr; bkqPayloadDmaCmd = nullptr; bkqWp = 0;
-    viqDesc = nullptr; viqDmaCmd = nullptr; viqPayloadDesc = nullptr; viqPayloadDmaCmd = nullptr; viqWp = 0;
-    voqDesc = nullptr; voqDmaCmd = nullptr; voqPayloadDesc = nullptr; voqPayloadDmaCmd = nullptr; voqWp = 0;
     rxBufferDmaCmd = nullptr;
     rxBufferVirtAddr = nullptr;
     rxRp = 0;
@@ -1650,12 +1634,14 @@ IOReturn RealtekRTL8822C::setPropertiesGated(OSObject *properties) {
         UInt32 poolCount = 0;
         UInt32 poolMinimum = 0;
         bool poolPending = false;
+        bool poolIndividualFallback = false;
         if (rxPacketPoolLock) {
             IOInterruptState interruptState =
                 IOSimpleLockLockDisableInterrupt(rxPacketPoolLock);
             poolCount = rxPacketPoolCount;
             poolMinimum = rxPacketPoolMinimum;
             poolPending = rxPacketPoolRefillPending;
+            poolIndividualFallback = rxPacketPoolIndividualFallback;
             IOSimpleLockUnlockEnableInterrupt(rxPacketPoolLock, interruptState);
         }
         char rxPoolDb[384];
@@ -1671,7 +1657,7 @@ IOReturn RealtekRTL8822C::setPropertiesGated(OSObject *properties) {
                  (unsigned int)debugRxPacketPoolRefilled,
                  (unsigned int)debugRxPacketPoolBatchCalls,
                  (unsigned int)debugRxPacketPoolAllocFailures,
-                 (unsigned int)debugRxPacketPoolMisses);
+                 poolIndividualFallback ? 1U : 0U);
         RTW_DEBUG_PROPERTY("Debug_RX_Packet_Pool", rxPoolDb);
         UInt32 legacy = 0, ht = 0, vht1 = 0, vht2 = 0;
         UInt32 topCount = 0;
@@ -2280,8 +2266,8 @@ void RealtekRTL8822C::publishDebugSnapshot() {
 #if RTW_DEBUG
     char snapshot[384];
     snprintf(snapshot, sizeof(snapshot),
-             "diag=0.0.2 state=%s scan=%d primary=%d center=%d bw=%u rx_rp=%u mgmt_wp=%u mgmt_rp=%u beq_wp=%u beq_rp=%u isr=%d auth_rx=%d mgntdok=%d c2h=%d auth_try=%u assoc_try=%u txba=%d port=%d wpa=%d m1=%u m3=%u",
-             connectionStateName(), customScanResultsCount, targetChannel,
+             "diag=%s state=%s scan=%d primary=%d center=%d bw=%u rx_rp=%u mgmt_wp=%u mgmt_rp=%u beq_wp=%u beq_rp=%u isr=%d auth_rx=%d mgntdok=%d c2h=%d auth_try=%u assoc_try=%u txba=%d port=%d wpa=%d m1=%u m3=%u",
+             RTW_VERSION, connectionStateName(), customScanResultsCount, targetChannel,
              targetCenterChannel,
              targetBandwidth == 2 ? 80U : (targetBandwidth == 1 ? 40U : 20U),
              (unsigned int)rxRp, (unsigned int)mgmtWp, (unsigned int)mgmtRp,
@@ -2291,7 +2277,7 @@ void RealtekRTL8822C::publishDebugSnapshot() {
              baEstablished ? 1 : 0, portAuthorized ? 1 : 0,
              (int)wpaState, (unsigned int)wpaRxM1, (unsigned int)wpaRxM3);
     RTW_DEBUG_PROPERTY("Debug_Snapshot", snapshot);
-    RTW_DEBUG_PROPERTY("Debug_Diagnostics_Revision", "0.0.3-full-band-passive-scan");
+    RTW_DEBUG_PROPERTY("Debug_Diagnostics_Revision", RTW_VERSION);
     RTW_DEBUG_PROPERTY("Debug_HotPath_Diagnostics",
                        "profile=Debug sample=1/1024 ordinary-tx-rx");
 #endif
@@ -2509,12 +2495,55 @@ void RealtekRTL8822C::publishSignalStrength() {
     lastSignalPublishTime = now;
 }
 
+void RealtekRTL8822C::publishRxPacketPoolSetup(const char* status,
+                                               UInt32 ready,
+                                               UInt32 attempts) {
+    if (!pciDevice) return;
+    pciDevice->setProperty("RTL8822CRXPacketPoolStatus",
+                           status ? status : "unknown");
+#if RTW_DEBUG
+    SInt32 lastError = rxPacketPoolLastError;
+    UInt32 lastRequested = rxPacketPoolLastRequested;
+    UInt32 lastAllocated = rxPacketPoolLastAllocated;
+    UInt32 smallestBatch = rxPacketPoolSmallestBatch;
+    bool individualFallback = rxPacketPoolIndividualFallback;
+    if (rxPacketPoolLock) {
+        IOInterruptState interruptState =
+            IOSimpleLockLockDisableInterrupt(rxPacketPoolLock);
+        lastError = rxPacketPoolLastError;
+        lastRequested = rxPacketPoolLastRequested;
+        lastAllocated = rxPacketPoolLastAllocated;
+        smallestBatch = rxPacketPoolSmallestBatch;
+        individualFallback = rxPacketPoolIndividualFallback;
+        IOSimpleLockUnlockEnableInterrupt(rxPacketPoolLock, interruptState);
+    }
+    char detail[256];
+    snprintf(detail, sizeof(detail),
+             "status=%s ready=%u attempts=%u last_request=%u last_allocated=%u last_errno=%d smallest_batch=%u individual_fallback=%d",
+             status ? status : "unknown", (unsigned int)ready,
+             (unsigned int)attempts,
+             (unsigned int)lastRequested,
+             (unsigned int)lastAllocated, (int)lastError,
+             (unsigned int)smallestBatch,
+             individualFallback ? 1 : 0);
+    pciDevice->setProperty("RTL8822CDebugRXPacketPoolSetup", detail);
+#else
+    (void)ready;
+    (void)attempts;
+#endif
+}
+
 bool RealtekRTL8822C::setupRxPacketPool() {
-    if (!rxPacketPoolLock || rxPacketPoolWorkLoop || rxPacketPoolTimer)
+    if (!rxPacketPoolLock || rxPacketPoolWorkLoop || rxPacketPoolTimer) {
+        publishRxPacketPoolSetup("invalid-state", rxPacketPoolCount, 0);
         return false;
+    }
 
     rxPacketPoolWorkLoop = IOWorkLoop::workLoop();
-    if (!rxPacketPoolWorkLoop) return false;
+    if (!rxPacketPoolWorkLoop) {
+        publishRxPacketPoolSetup("workloop-failed", 0, 0);
+        return false;
+    }
 
     rxPacketPoolTimer = IOTimerEventSource::timerEventSource(
         this,
@@ -2522,6 +2551,7 @@ bool RealtekRTL8822C::setupRxPacketPool() {
                              &RealtekRTL8822C::rxPacketPoolTimerFired));
     if (!rxPacketPoolTimer ||
         rxPacketPoolWorkLoop->addEventSource(rxPacketPoolTimer) != kIOReturnSuccess) {
+        publishRxPacketPoolSetup("timer-failed", 0, 0);
         teardownRxPacketPool();
         return false;
     }
@@ -2531,14 +2561,29 @@ bool RealtekRTL8822C::setupRxPacketPool() {
     rxPacketPoolStopping = false;
     rxPacketPoolRefillPending = false;
     rxPacketPoolMinimum = kRtwRxPacketPoolCapacity;
+    rxPacketPoolLastError = 0;
+    rxPacketPoolLastRequested = 0;
+    rxPacketPoolLastAllocated = 0;
+    rxPacketPoolSmallestBatch = 0;
+    rxPacketPoolIndividualFallback = false;
     IOSimpleLockUnlockEnableInterrupt(rxPacketPoolLock, interruptState);
 
-    // This one-time reserve is built before hardware interrupts are enabled.
-    // Subsequent replacements are allocated only on rxPacketPoolWorkLoop.
-    refillRxPacketPool(kRtwRxPacketPoolCapacity);
+    // Build the initial reserve in the same bounded batches used by the
+    // replenisher. A single 512-packet MBUF_DONTWAIT request can be rejected
+    // under transient allocator pressure even when smaller requests succeed.
+    UInt32 attempts = 0;
+    while (attempts < 8) {
+        interruptState = IOSimpleLockLockDisableInterrupt(rxPacketPoolLock);
+        UInt32 current = rxPacketPoolCount;
+        IOSimpleLockUnlockEnableInterrupt(rxPacketPoolLock, interruptState);
+        if (current >= kRtwRxPacketPoolCapacity) break;
+        attempts++;
+        if (refillRxPacketPool(kRtwRxPacketPoolRefillBudget) != 0) break;
+    }
 
     interruptState = IOSimpleLockLockDisableInterrupt(rxPacketPoolLock);
     UInt32 ready = rxPacketPoolCount;
+    bool usedIndividualFallback = rxPacketPoolIndividualFallback;
     bool scheduleRefill = ready < kRtwRxPacketPoolCapacity &&
                           !rxPacketPoolStopping;
     if (scheduleRefill) rxPacketPoolRefillPending = true;
@@ -2547,10 +2592,14 @@ bool RealtekRTL8822C::setupRxPacketPool() {
     // A small partial reserve would immediately fall back into allocation in
     // the RX poll. Require enough packets to cover several complete slices.
     if (ready < 128) {
+        publishRxPacketPoolSetup("allocation-failed", ready, attempts);
         teardownRxPacketPool();
         return false;
     }
     if (scheduleRefill) rxPacketPoolTimer->setTimeoutUS(1000);
+    publishRxPacketPoolSetup(usedIndividualFallback ?
+                                 "ready-individual-fallback" : "ready",
+                             ready, attempts);
 
     char db[192];
     snprintf(db, sizeof(db),
@@ -2602,15 +2651,15 @@ void RealtekRTL8822C::teardownRxPacketPool() {
     rxPacketPoolCount = 0;
 }
 
-void RealtekRTL8822C::refillRxPacketPool(UInt32 budget) {
-    if (!rxPacketPoolLock) return;
+int RealtekRTL8822C::refillRxPacketPool(UInt32 budget) {
+    if (!rxPacketPoolLock) return -1;
     IOInterruptState interruptState =
         IOSimpleLockLockDisableInterrupt(rxPacketPoolLock);
     UInt32 missing = rxPacketPoolStopping ? 0 :
         kRtwRxPacketPoolCapacity - rxPacketPoolCount;
     IOSimpleLockUnlockEnableInterrupt(rxPacketPoolLock, interruptState);
     UInt32 requested = missing < budget ? missing : budget;
-    if (requested == 0) return;
+    if (requested == 0) return 0;
 
     // Allocate a packet list in one KPI call. v62 proved that the reserve never
     // emptied, but replenishing every consumed packet with an individual
@@ -2618,19 +2667,72 @@ void RealtekRTL8822C::refillRxPacketPool(UInt32 budget) {
     // high-priority work loop and regressed uplink. Batch allocation amortizes
     // the allocator/global-cache boundary while preserving nonblocking RX.
     mbuf_t list = nullptr;
-    unsigned int chunks = 1;
-    debugRxPacketPoolBatchCalls++;
-    if (mbuf_allocpacket_list(requested, MBUF_DONTWAIT,
-                              kRtwRxPacketBufferSize,
-                              &chunks, &list) != 0 || !list) {
+    UInt32 allocated = 0;
+    UInt32 batch = requested;
+    int allocationError = 0;
+    bool usedIndividualFallback = false;
+    while (batch >= 16) {
+        unsigned int chunks = 1;
+        debugRxPacketPoolBatchCalls++;
+        allocationError = mbuf_allocpacket_list(
+            batch, MBUF_DONTWAIT, kRtwRxPacketBufferSize, &chunks, &list);
+        if (allocationError == 0 && list) break;
         debugRxPacketPoolAllocFailures++;
-        return;
+        while (list) {
+            mbuf_t packet = list;
+            list = mbuf_nextpkt(packet);
+            mbuf_setnextpkt(packet, nullptr);
+            freePacket(packet);
+        }
+        list = nullptr;
+        batch /= 2;
     }
 
-    for (mbuf_t packet = list; packet; packet = mbuf_nextpkt(packet))
-        mbuf_adj(packet, ETHER_ALIGN);
+    if (list) {
+        for (mbuf_t packet = list; packet; packet = mbuf_nextpkt(packet)) {
+            mbuf_adj(packet, ETHER_ALIGN);
+            allocated++;
+        }
+    } else {
+        // Some older kernels can reject packet-list allocation while accepting
+        // the equivalent individual nonblocking allocations. Keep this path
+        // bounded to sixteen packets per worker invocation.
+        mbuf_t tail = nullptr;
+        UInt32 individualBudget = requested < 16 ? requested : 16;
+        for (UInt32 i = 0; i < individualBudget; i++) {
+            mbuf_t packet = nullptr;
+            unsigned int chunks = 1;
+            allocationError = mbuf_allocpacket(
+                MBUF_DONTWAIT, kRtwRxPacketBufferSize, &chunks, &packet);
+            if (allocationError != 0 || !packet) {
+                debugRxPacketPoolAllocFailures++;
+                break;
+            }
+            mbuf_adj(packet, ETHER_ALIGN);
+            mbuf_setnextpkt(packet, nullptr);
+            if (tail) mbuf_setnextpkt(tail, packet); else list = packet;
+            tail = packet;
+            allocated++;
+        }
+        usedIndividualFallback = allocated != 0;
+    }
+
+    if (!list || allocated == 0) {
+        interruptState = IOSimpleLockLockDisableInterrupt(rxPacketPoolLock);
+        rxPacketPoolLastRequested = requested;
+        rxPacketPoolLastAllocated = 0;
+        rxPacketPoolLastError = allocationError ? allocationError : -1;
+        IOSimpleLockUnlockEnableInterrupt(rxPacketPoolLock, interruptState);
+        return allocationError ? allocationError : -1;
+    }
 
     interruptState = IOSimpleLockLockDisableInterrupt(rxPacketPoolLock);
+    rxPacketPoolLastRequested = requested;
+    rxPacketPoolLastAllocated = allocated;
+    rxPacketPoolLastError = 0;
+    if (rxPacketPoolSmallestBatch == 0 || allocated < rxPacketPoolSmallestBatch)
+        rxPacketPoolSmallestBatch = allocated;
+    if (usedIndividualFallback) rxPacketPoolIndividualFallback = true;
     while (list && !rxPacketPoolStopping &&
            rxPacketPoolCount < kRtwRxPacketPoolCapacity) {
         mbuf_t packet = list;
@@ -2649,6 +2751,7 @@ void RealtekRTL8822C::refillRxPacketPool(UInt32 budget) {
         mbuf_setnextpkt(packet, nullptr);
         freePacket(packet);
     }
+    return 0;
 }
 
 mbuf_t RealtekRTL8822C::takeRxPacket() {
@@ -2691,7 +2794,7 @@ void RealtekRTL8822C::rxPacketPoolTimerFired(OSObject* owner,
     IOSimpleLockUnlockEnableInterrupt(rxPacketPoolLock, interruptState);
     if (stopping) return;
 
-    refillRxPacketPool(kRtwRxPacketPoolRefillBudget);
+    (void)refillRxPacketPool(kRtwRxPacketPoolRefillBudget);
 
     interruptState = IOSimpleLockLockDisableInterrupt(rxPacketPoolLock);
     // Preserve hysteresis: after one batch reaches the high side of the low
@@ -3550,6 +3653,7 @@ void RealtekRTL8822C::beginStartDiagnostics(IOPCIDevice* provider) {
     provider->removeProperty("RTL8822CPCIELinkWidth");
     provider->removeProperty("RTL8822CPCIPhyConfig");
     provider->removeProperty("RTL8822CPCIeLinkConfig");
+    provider->removeProperty("RTL8822CRXPacketPoolStatus");
 #if RTW_DEBUG
     provider->removeProperty("RTL8822CDebugFailureDetail");
     provider->removeProperty("RTL8822CDebugStartTrace");
@@ -3559,6 +3663,7 @@ void RealtekRTL8822C::beginStartDiagnostics(IOPCIDevice* provider) {
     provider->removeProperty("RTL8822CDebugRFE6CLKREQ");
     provider->removeProperty("RTL8822CDebugDBISetup");
     provider->removeProperty("RTL8822CDebugPCIPhyConfig");
+    provider->removeProperty("RTL8822CDebugRXPacketPoolSetup");
 #endif
 }
 
@@ -4178,53 +4283,18 @@ bool RealtekRTL8822C::start(IOService* provider) {
     write32(0x0328, (UInt32)(beqPhysAddr & 0xFFFFFFFF));
     write16(0x0388, 256);
 
-    // === BKQ Allocation ===
-    bkqDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kRtwDmaRingMemoryOptions, 128 * 16, 0x00000000FFFFFFFFULL);
-    if (!bkqDesc) return failStart(provider, "Failed to allocate BKQ descriptor", "start:bkq-allocation-failed");
-    bkqDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost32, 32, 0, IODMACommand::kBypassed, 0, 0, nullptr);
-    if (!bkqDmaCmd) return failStart(provider, "Failed to create BKQ DMA command", "start:bkq-dma-command-failed");
-    if (!prepareDmaMapping(bkqDesc, bkqDmaCmd, &bkqPhysAddr))
-        return failStart(provider, "Failed to map BKQ DMA memory", "start:bkq-dma-map-failed");
-    bkqPayloadDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kRtwDmaPayloadMemoryOptions, 128 * 2048, 0x00000000FFFFFFFFULL);
-    if (!bkqPayloadDesc) return failStart(provider, "Failed to allocate BKQ payload", "start:bkq-payload-allocation-failed");
-    bkqPayloadDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost32, 32, 0, IODMACommand::kBypassed, 0, 0, nullptr);
-    if (!bkqPayloadDmaCmd) return failStart(provider, "Failed to create BKQ payload DMA command", "start:bkq-payload-dma-command-failed");
-    if (!prepareDmaMapping(bkqPayloadDesc, bkqPayloadDmaCmd, &bkqPayloadPhysAddr))
-        return failStart(provider, "Failed to map BKQ payload DMA memory", "start:bkq-payload-dma-map-failed");
-    write32(0x0330, (UInt32)(bkqPhysAddr & 0xFFFFFFFF));
-    write16(0x038A, 128);
-
-    // === VIQ Allocation ===
-    viqDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kRtwDmaRingMemoryOptions, 128 * 16, 0x00000000FFFFFFFFULL);
-    if (!viqDesc) return failStart(provider, "Failed to allocate VIQ descriptor", "start:viq-allocation-failed");
-    viqDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost32, 32, 0, IODMACommand::kBypassed, 0, 0, nullptr);
-    if (!viqDmaCmd) return failStart(provider, "Failed to create VIQ DMA command", "start:viq-dma-command-failed");
-    if (!prepareDmaMapping(viqDesc, viqDmaCmd, &viqPhysAddr))
-        return failStart(provider, "Failed to map VIQ DMA memory", "start:viq-dma-map-failed");
-    viqPayloadDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kRtwDmaPayloadMemoryOptions, 128 * 2048, 0x00000000FFFFFFFFULL);
-    if (!viqPayloadDesc) return failStart(provider, "Failed to allocate VIQ payload", "start:viq-payload-allocation-failed");
-    viqPayloadDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost32, 32, 0, IODMACommand::kBypassed, 0, 0, nullptr);
-    if (!viqPayloadDmaCmd) return failStart(provider, "Failed to create VIQ payload DMA command", "start:viq-payload-dma-command-failed");
-    if (!prepareDmaMapping(viqPayloadDesc, viqPayloadDmaCmd, &viqPayloadPhysAddr))
-        return failStart(provider, "Failed to map VIQ payload DMA memory", "start:viq-payload-dma-map-failed");
-    write32(0x0320, (UInt32)(viqPhysAddr & 0xFFFFFFFF));
-    write16(0x0386, 128);
-
-    // === VOQ Allocation ===
-    voqDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kRtwDmaRingMemoryOptions, 128 * 16, 0x00000000FFFFFFFFULL);
-    if (!voqDesc) return failStart(provider, "Failed to allocate VOQ descriptor", "start:voq-allocation-failed");
-    voqDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost32, 32, 0, IODMACommand::kBypassed, 0, 0, nullptr);
-    if (!voqDmaCmd) return failStart(provider, "Failed to create VOQ DMA command", "start:voq-dma-command-failed");
-    if (!prepareDmaMapping(voqDesc, voqDmaCmd, &voqPhysAddr))
-        return failStart(provider, "Failed to map VOQ DMA memory", "start:voq-dma-map-failed");
-    voqPayloadDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kRtwDmaPayloadMemoryOptions, 128 * 2048, 0x00000000FFFFFFFFULL);
-    if (!voqPayloadDesc) return failStart(provider, "Failed to allocate VOQ payload", "start:voq-payload-allocation-failed");
-    voqPayloadDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost32, 32, 0, IODMACommand::kBypassed, 0, 0, nullptr);
-    if (!voqPayloadDmaCmd) return failStart(provider, "Failed to create VOQ payload DMA command", "start:voq-payload-dma-command-failed");
-    if (!prepareDmaMapping(voqPayloadDesc, voqPayloadDmaCmd, &voqPayloadPhysAddr))
-        return failStart(provider, "Failed to map VOQ payload DMA memory", "start:voq-payload-dma-map-failed");
-    write32(0x0318, (UInt32)(voqPhysAddr & 0xFFFFFFFF));
-    write16(0x0384, 128);
+    // BKQ/VIQ/VOQ are intentionally left unallocated. The current TX path
+    // submits data only to BEQ and management frames only to MGMTQ; reserving
+    // three additional physically-contiguous rings and payload arenas merely
+    // added startup failure points and consumed roughly 0.75 MiB of DMA RAM.
+    // Keep their hardware bases and sizes disabled until a real AC queue is
+    // implemented.
+    write32(0x0330, 0);
+    write16(0x038A, 0);
+    write32(0x0320, 0);
+    write16(0x0386, 0);
+    write32(0x0318, 0);
+    write16(0x0384, 0);
 
     // === MGMTQ Allocation ===
     mgmtDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kRtwDmaRingMemoryOptions, 128 * 16, 0x00000000FFFFFFFFULL);
@@ -4450,21 +4520,6 @@ void RealtekRTL8822C::stop(IOService* provider) {
     if (beqPayloadDmaCmd) { beqPayloadDmaCmd->complete(); beqPayloadDmaCmd->release(); beqPayloadDmaCmd = nullptr; }
     if (beqPayloadDesc) { beqPayloadDesc->complete(); beqPayloadDesc->release(); beqPayloadDesc = nullptr; }
 
-    if (bkqDmaCmd) { bkqDmaCmd->complete(); bkqDmaCmd->release(); bkqDmaCmd = nullptr; }
-    if (bkqDesc) { bkqDesc->complete(); bkqDesc->release(); bkqDesc = nullptr; }
-    if (bkqPayloadDmaCmd) { bkqPayloadDmaCmd->complete(); bkqPayloadDmaCmd->release(); bkqPayloadDmaCmd = nullptr; }
-    if (bkqPayloadDesc) { bkqPayloadDesc->complete(); bkqPayloadDesc->release(); bkqPayloadDesc = nullptr; }
-
-    if (viqDmaCmd) { viqDmaCmd->complete(); viqDmaCmd->release(); viqDmaCmd = nullptr; }
-    if (viqDesc) { viqDesc->complete(); viqDesc->release(); viqDesc = nullptr; }
-    if (viqPayloadDmaCmd) { viqPayloadDmaCmd->complete(); viqPayloadDmaCmd->release(); viqPayloadDmaCmd = nullptr; }
-    if (viqPayloadDesc) { viqPayloadDesc->complete(); viqPayloadDesc->release(); viqPayloadDesc = nullptr; }
-
-    if (voqDmaCmd) { voqDmaCmd->complete(); voqDmaCmd->release(); voqDmaCmd = nullptr; }
-    if (voqDesc) { voqDesc->complete(); voqDesc->release(); voqDesc = nullptr; }
-    if (voqPayloadDmaCmd) { voqPayloadDmaCmd->complete(); voqPayloadDmaCmd->release(); voqPayloadDmaCmd = nullptr; }
-    if (voqPayloadDesc) { voqPayloadDesc->complete(); voqPayloadDesc->release(); voqPayloadDesc = nullptr; }
-
     if (mgmtDmaCmd) { mgmtDmaCmd->complete(); mgmtDmaCmd->release(); mgmtDmaCmd = nullptr; }
     if (mgmtDesc) { mgmtDesc->complete(); mgmtDesc->release(); mgmtDesc = nullptr; }
     if (mgmtPayloadDmaCmd) { mgmtPayloadDmaCmd->complete(); mgmtPayloadDmaCmd->release(); mgmtPayloadDmaCmd = nullptr; }
@@ -4481,12 +4536,9 @@ void RealtekRTL8822C::stop(IOService* provider) {
     if (rxBufferDesc) { rxBufferDesc->complete(); rxBufferDesc->release(); rxBufferDesc = nullptr; }
 
     beqWp = 0; beqRp = 0; beqLastHwRp = 0; beqOutstanding = 0; beqQueueStalled = false;
-    h2cqWp = mgmtWp = mgmtRp = bkqWp = viqWp = voqWp = rxRp = 0;
+    h2cqWp = mgmtWp = mgmtRp = rxRp = 0;
     h2cqPhysAddr = h2cPayloadPhysAddr = 0;
     beqPhysAddr = beqPayloadPhysAddr = 0;
-    bkqPhysAddr = bkqPayloadPhysAddr = 0;
-    viqPhysAddr = viqPayloadPhysAddr = 0;
-    voqPhysAddr = voqPayloadPhysAddr = 0;
     mgmtPhysAddr = mgmtPayloadPhysAddr = 0;
     rxRingPhysAddr = rxBufferPhysAddr = 0;
     rxBufferVirtAddr = nullptr;
@@ -4552,11 +4604,10 @@ void RealtekRTL8822C::stop(IOService* provider) {
 }
 
 bool RealtekRTL8822C::reprogramDmaRings() {
-    if (!h2cqDesc || !h2cPayloadDesc || !beqDesc || !bkqDesc || !viqDesc || !voqDesc ||
+    if (!h2cqDesc || !h2cPayloadDesc || !beqDesc ||
         !mgmtDesc || !rxRingDesc || !rxBufferDesc ||
         h2cqPhysAddr == 0 || h2cPayloadPhysAddr == 0 ||
-        beqPhysAddr == 0 || bkqPhysAddr == 0 ||
-        viqPhysAddr == 0 || voqPhysAddr == 0 || mgmtPhysAddr == 0 ||
+        beqPhysAddr == 0 || mgmtPhysAddr == 0 ||
         rxRingPhysAddr == 0 || rxBufferPhysAddr == 0) {
         setProperty("DriverStatus", "Cannot restore DMA rings: allocation or IOVA missing");
         return false;
@@ -4565,9 +4616,6 @@ bool RealtekRTL8822C::reprogramDmaRings() {
     memset(h2cqDesc->getBytesNoCopy(), 0, 128U * 16U);
     memset(h2cPayloadDesc->getBytesNoCopy(), 0, 128U * 128U);
     memset(beqDesc->getBytesNoCopy(), 0, 256U * 16U);
-    memset(bkqDesc->getBytesNoCopy(), 0, 128U * 16U);
-    memset(viqDesc->getBytesNoCopy(), 0, 128U * 16U);
-    memset(voqDesc->getBytesNoCopy(), 0, 128U * 16U);
     memset(mgmtDesc->getBytesNoCopy(), 0, 128U * 16U);
 
     UInt8* rxRing = static_cast<UInt8*>(rxRingDesc->getBytesNoCopy());
@@ -4584,19 +4632,19 @@ bool RealtekRTL8822C::reprogramDmaRings() {
     h2cqWp = 0;
     beqWp = beqRp = beqLastHwRp = beqOutstanding = 0;
     beqQueueStalled = false;
-    bkqWp = viqWp = voqWp = mgmtWp = mgmtRp = rxRp = 0;
+    mgmtWp = mgmtRp = rxRp = 0;
 
     write32(0x1320, static_cast<UInt32>(h2cqPhysAddr));
     write16(0x1328, 128);
     write32(0x1330, read32(0x1330) | (1U << 16) | (1U << 8));
     write32(0x0328, static_cast<UInt32>(beqPhysAddr));
     write16(0x0388, 256);
-    write32(0x0330, static_cast<UInt32>(bkqPhysAddr));
-    write16(0x038a, 128);
-    write32(0x0320, static_cast<UInt32>(viqPhysAddr));
-    write16(0x0386, 128);
-    write32(0x0318, static_cast<UInt32>(voqPhysAddr));
-    write16(0x0384, 128);
+    write32(0x0330, 0);
+    write16(0x038a, 0);
+    write32(0x0320, 0);
+    write16(0x0386, 0);
+    write32(0x0318, 0);
+    write16(0x0384, 0);
     write32(0x0310, static_cast<UInt32>(mgmtPhysAddr));
     write16(0x0380, 128);
     write32(0x0338, static_cast<UInt32>(rxRingPhysAddr));
@@ -4606,9 +4654,6 @@ bool RealtekRTL8822C::reprogramDmaRings() {
     h2cqDmaCmd->synchronize(kIODirectionOut);
     h2cPayloadDmaCmd->synchronize(kIODirectionOut);
     beqDmaCmd->synchronize(kIODirectionOut);
-    bkqDmaCmd->synchronize(kIODirectionOut);
-    viqDmaCmd->synchronize(kIODirectionOut);
-    voqDmaCmd->synchronize(kIODirectionOut);
     mgmtDmaCmd->synchronize(kIODirectionOut);
     rxRingDmaCmd->synchronize(kIODirectionOut);
     OSSynchronizeIO();
@@ -5857,7 +5902,10 @@ RealtekRTL8822C::DataEnqueueResult RealtekRTL8822C::enqueueEthernetData(
         return !ethFrame || ethLen < 14 || ethLen > 1514 ?
             DATA_ENQUEUE_INVALID_FRAME : DATA_ENQUEUE_NOT_READY;
     if (protect && !wpaPtkInstalled) return DATA_ENQUEUE_NOT_READY;
-    UInt16 ethType = (UInt16)(((UInt16)ethFrame[12] << 8) | (UInt16)ethFrame[13]);
+#if RTW_DEBUG
+    UInt16 ethType = (UInt16)(((UInt16)ethFrame[12] << 8) |
+                              (UInt16)ethFrame[13]);
+#endif
     UInt8 wifi[1544];
     UInt32 wifiLen = 0;
     if (!translate8023to80211(ethFrame, ethLen, wifi, &wifiLen))
@@ -5935,8 +5983,9 @@ RealtekRTL8822C::DataEnqueueResult RealtekRTL8822C::enqueueEthernetData(
         descriptor[3] |= (UInt32)maxAggregate << 17;
     }
 
-    UInt8 reportSn = 0;
+#if RTW_DEBUG
     bool isIcmp = ethType == 0x0800 && ethLen >= 35 && ethFrame[23] == 1;
+    UInt8 reportSn = 0;
     if (requestReport && !debugDataReportPending && (ethType == 0x0806 || isIcmp)) {
         txSeqNum = (txSeqNum + 1) % 64;
         reportSn = (UInt8)((txSeqNum << 2) & 0xfc);
@@ -5947,6 +5996,9 @@ RealtekRTL8822C::DataEnqueueResult RealtekRTL8822C::enqueueEthernetData(
         descriptor[2] |= 1U << 19;
         descriptor[6] = reportSn;
     }
+#else
+    (void)requestReport;
+#endif
 
     UInt16 checksum = 0;
     volatile UInt16* words = (volatile UInt16*)descriptor;
@@ -7154,6 +7206,7 @@ void RealtekRTL8822C::handleInterrupt(OSObject* owner, IOInterruptEventSource* s
                 continue;
             }
 
+#if RTW_DEBUG
             // Debug dump of received packet metadata and raw descriptor (throttled)
             if (!timerPoll && (isrCallsCount & 0x3FF) == 1) {
                 char pkt_info[256];
@@ -7181,6 +7234,7 @@ void RealtekRTL8822C::handleInterrupt(OSObject* owner, IOInterruptEventSource* s
                          rx_buf[16], rx_buf[17], rx_buf[18], rx_buf[19]);
                 RTW_DEBUG_PROPERTY("Debug_Rx_Raw_Desc", raw_desc);
             }
+#endif
 
             if (pkt_len > 0 && !crc_err && !icv_err && !is_c2h) {
                 UInt8* rx_frame   = rx_buf + pkt_offset;
@@ -7263,6 +7317,10 @@ void RealtekRTL8822C::handleInterrupt(OSObject* owner, IOInterruptEventSource* s
                     handleRxDataFrame(rx_frame, payload_len, enc_type, decrypted);
                 }
             } else if (is_c2h && !crc_err && pkt_len >= 2) {
+#if RTW_DEBUG
+                // This driver has no operational C2H consumer here. CCX and
+                // generic reports below exist solely for diagnostics, so do
+                // not parse or format them in the Release receive path.
                 const UInt8* c2h = rx_buf + pkt_offset;
                 UInt8 c2h_id = c2h[0];
                 UInt8 c2h_seq = c2h[1];
@@ -7370,6 +7428,7 @@ void RealtekRTL8822C::handleInterrupt(OSObject* owner, IOInterruptEventSource* s
                              descSame ? 1 : 0, frameSame ? 1 : 0, descXor);
                     RTW_DEBUG_PROPERTY("Debug_MGMT_PostCCX", postTx);
                 }
+#endif
             }
 
             rxRp = (rxRp + 1) % 512;
@@ -9392,40 +9451,36 @@ void RealtekRTL8822C::handleControlFrame(const UInt8* frame, UInt32 len) {
 }
 
 bool RealtekRTL8822C::transmitWifiFrame(const UInt8* frame, UInt32 len, UInt8 qsel) {
-    IOBufferMemoryDescriptor* desc = beqDesc;
-    IOBufferMemoryDescriptor* payloadDesc = beqPayloadDesc;
-    IODMACommand* dmaCmd = beqDmaCmd;
-    IODMACommand* payloadDmaCmd = beqPayloadDmaCmd;
-    UInt32 wp = beqWp;
-    UInt32 idx_reg = 0x03A8; // BEQ
-
-    if (qsel == 18) {
-        desc = mgmtDesc;
-        payloadDesc = mgmtPayloadDesc;
-        dmaCmd = mgmtDmaCmd;
-        payloadDmaCmd = mgmtPayloadDmaCmd;
-        wp = mgmtWp;
-        idx_reg = 0x03B0; // MGMTQ
-        if (((wp + 1) % 128) == mgmtRp) {
-            setProperty("DriverStatus", "MGMT queue full!");
-            return false;
-        }
+    // Data traffic must pass through enqueueEthernetData(), which owns BEQ
+    // locking, completion accounting and output-queue backpressure. The old
+    // non-management fallback wrote BEQ without any of those protections.
+    if (!frame || len == 0 || len > 2000 || qsel != 18) return false;
+    IOBufferMemoryDescriptor* desc = mgmtDesc;
+    IOBufferMemoryDescriptor* payloadDesc = mgmtPayloadDesc;
+    IODMACommand* dmaCmd = mgmtDmaCmd;
+    IODMACommand* payloadDmaCmd = mgmtPayloadDmaCmd;
+    UInt32 wp = mgmtWp;
+    const UInt32 idx_reg = 0x03B0;
+    if (((wp + 1) % 128) == mgmtRp) {
+        setProperty("DriverStatus", "MGMT queue full!");
+        return false;
     }
 
-    if (!ioBase || !payloadDesc || !desc) return false;
+    if (!ioBase || !payloadDesc || !desc || !dmaCmd || !payloadDmaCmd)
+        return false;
 
     volatile UInt32* buf_desc = (volatile UInt32*)((UInt8*)desc->getBytesNoCopy() + wp * 16);
     UInt8* slot_virt = (UInt8*)payloadDesc->getBytesNoCopy() + wp * 2048;
-    UInt32 slot_phys = (UInt32)(payloadDesc->getPhysicalSegment(wp * 2048, NULL) & 0xFFFFFFFF);
-    UInt32 slot_dma = slot_phys;
-
-    if (qsel == 18) {
-        UInt32 slot_iova = (UInt32)(mgmtPayloadPhysAddr + wp * 2048);
-        slot_dma = slot_iova;
-        char dmaDb[128];
-        snprintf(dmaDb, sizeof(dmaDb), "phys=0x%08x iova=0x%08x match=%d", slot_phys, slot_iova, slot_phys == slot_iova);
-        RTW_DEBUG_PROPERTY("Debug_MGMT_DMA_Addr", dmaDb);
-    }
+    UInt32 slot_dma = (UInt32)(mgmtPayloadPhysAddr + wp * 2048);
+#if RTW_DEBUG
+    UInt32 slot_phys = (UInt32)(payloadDesc->getPhysicalSegment(
+        wp * 2048, NULL) & 0xFFFFFFFF);
+    char dmaDb[128];
+    snprintf(dmaDb, sizeof(dmaDb),
+             "phys=0x%08x iova=0x%08x match=%d", slot_phys, slot_dma,
+             slot_phys == slot_dma);
+    RTW_DEBUG_PROPERTY("Debug_MGMT_DMA_Addr", dmaDb);
+#endif
 
     volatile UInt32* tx_desc = (volatile UInt32*)slot_virt;
     memset((void*)tx_desc, 0, 48);
@@ -9433,13 +9488,9 @@ bool RealtekRTL8822C::transmitWifiFrame(const UInt8* frame, UInt32 len, UInt8 qs
     // W0: TXPKTSIZE, OFFSET, LS, DISQSELSEQ
     tx_desc[0] = (len & 0xFFFF) | (48 << 16) | (1U << 26) | (1U << 31);
 
-    UInt8 rate_id = 8; // RTW_RATEID_B_20M for non-management traffic
-    UInt8 datarate = 0x00; // DESC_RATE1M for non-management traffic
-    if (qsel == 18) {
-        // Linux uses the G table for 5 GHz management and B_20M on 2.4 GHz.
-        rate_id = currentChannel.channel > 14 ? 7 : 8;
-        datarate = 0x04;   // DESC_RATE6M
-    }
+    // Linux uses the G table for 5 GHz management and B_20M on 2.4 GHz.
+    UInt8 rate_id = currentChannel.channel > 14 ? 7 : 8;
+    UInt8 datarate = 0x04; // DESC_RATE6M
 
     // W1: QSEL and RATE_ID
     tx_desc[1] = ((UInt32)qsel << 8) | ((UInt32)rate_id << 16);
@@ -9450,8 +9501,11 @@ bool RealtekRTL8822C::transmitWifiFrame(const UInt8* frame, UInt32 len, UInt8 qs
     // W4: DATARATE
     tx_desc[4] = datarate;
 
-    // W2: SPE_RPT (BIT 19) to request CCX TX report from firmware
+    // W2: SPE_RPT is diagnostic-only. Requesting a firmware C2H report for
+    // every management frame adds receive-side work with no Release consumer.
+#if RTW_DEBUG
     tx_desc[2] = (1U << 19);
+#endif
 
     // W6: SW_DEFINE = unique incrementing serial number (sequence)
     txSeqNum = (txSeqNum + 1) % 64;
@@ -9483,45 +9537,44 @@ bool RealtekRTL8822C::transmitWifiFrame(const UInt8* frame, UInt32 len, UInt8 qs
     buf_desc[2] = (len & 0xFFFF);                    // buf_size=len (payload)
     buf_desc[3] = slot_dma + 48;                     // DMA-mapped address of 802.11 frame
 
+#if RTW_DEBUG
     char tx_mgmt_db[256];
     snprintf(tx_mgmt_db, sizeof(tx_mgmt_db), "W0=0x%08x W1=0x%08x W2=0x%08x W3=0x%08x W4=0x%08x W6=0x%08x BD0=0x%08x BD1=0x%08x BD2=0x%08x BD3=0x%08x",
              (unsigned int)tx_desc[0], (unsigned int)tx_desc[1], (unsigned int)tx_desc[2], (unsigned int)tx_desc[3],
              (unsigned int)tx_desc[4], (unsigned int)tx_desc[6],
              (unsigned int)buf_desc[0], (unsigned int)buf_desc[1], (unsigned int)buf_desc[2], (unsigned int)buf_desc[3]);
 
-    if (qsel == 18) {
-        RTW_DEBUG_PROPERTY("Debug_MGMT_Last_Desc", tx_mgmt_db);
-    } else {
-        RTW_DEBUG_PROPERTY("Debug_Tx_Last_Mgmt", tx_mgmt_db);
-    }
+    RTW_DEBUG_PROPERTY("Debug_MGMT_Last_Desc", tx_mgmt_db);
+#endif
 
     payloadDmaCmd->synchronize(kIODirectionOut);
     dmaCmd->synchronize(kIODirectionOut);
     OSSynchronizeIO();
 
-    if (qsel == 18) {
-        debugMgmtSlot = wp;
-        debugMgmtReportSn = (UInt8)(tx_desc[6] & 0xfc);
-        debugMgmtOfdmTxBaseline = read32(0x2de0);
-        memcpy(debugMgmtShadow, slot_virt, sizeof(debugMgmtShadow));
-        debugMgmtShadowValid = true;
+#if RTW_DEBUG
+    debugMgmtSlot = wp;
+    debugMgmtReportSn = (UInt8)(tx_desc[6] & 0xfc);
+    debugMgmtOfdmTxBaseline = read32(0x2de0);
+    memcpy(debugMgmtShadow, slot_virt, sizeof(debugMgmtShadow));
+    debugMgmtShadowValid = true;
 
-        UInt16 descXor = 0;
-        for (UInt32 i = 0; i < 24; i++) {
-            descXor ^= OSReadLittleInt16(slot_virt, i * 2);
-        }
-        char frameHex[128];
-        UInt32 framePos = 0;
-        frameHex[0] = '\0';
-        UInt32 frameDumpLen = len < 30 ? len : 30;
-        for (UInt32 i = 0; i < frameDumpLen && framePos + 4 < sizeof(frameHex); i++) {
-            int written = snprintf(frameHex + framePos, sizeof(frameHex) - framePos,
-                                   "%02x%s", slot_virt[48 + i], i + 1 == frameDumpLen ? "" : " ");
-            if (written > 0) framePos += (UInt32)written;
-        }
+    UInt16 descXor = 0;
+    for (UInt32 i = 0; i < 24; i++) {
+        descXor ^= OSReadLittleInt16(slot_virt, i * 2);
+    }
+    char frameHex[128];
+    UInt32 framePos = 0;
+    frameHex[0] = '\0';
+    UInt32 frameDumpLen = len < 30 ? len : 30;
+    for (UInt32 i = 0; i < frameDumpLen && framePos + 4 < sizeof(frameHex); i++) {
+        int written = snprintf(frameHex + framePos, sizeof(frameHex) - framePos,
+                               "%02x%s", slot_virt[48 + i],
+                               i + 1 == frameDumpLen ? "" : " ");
+        if (written > 0) framePos += (UInt32)written;
+    }
 
-        char preTx[1024];
-        snprintf(preTx, sizeof(preTx),
+    char preTx[1024];
+    snprintf(preTx, sizeof(preTx),
                  "sn=%02x slot=%u len=%u idx=%08x cr=%02x pause=%02x txfifo=%08x txdma=%08x fwhw=%08x retry=%04x ack=%02x/%02x edcca=%u bb=%08x wire=%08x/%08x cca=%08x ant=%08x txmap=%08x path=%08x/%08x rf0=%05x/%05x rf18=%05x/%05x ofdm=%08x xor=%04x frame=%s",
                  debugMgmtReportSn, (unsigned int)debugMgmtSlot, (unsigned int)len,
                  (unsigned int)read32(0x03b0), read8(0x0100), read8(0x0522),
@@ -9538,16 +9591,11 @@ bool RealtekRTL8822C::transmitWifiFrame(const UInt8* frame, UInt32 len, UInt8 qs
                  (unsigned int)readRfMask(0, 0x18, 0xfffff),
                  (unsigned int)readRfMask(1, 0x18, 0xfffff),
                  (unsigned int)debugMgmtOfdmTxBaseline, descXor, frameHex);
-        RTW_DEBUG_PROPERTY("Debug_MGMT_PreDoorbell", preTx);
-    }
+    RTW_DEBUG_PROPERTY("Debug_MGMT_PreDoorbell", preTx);
+#endif
 
-    if (qsel == 18) {
-        wp = (wp + 1) % 128;
-        mgmtWp = wp;
-    } else {
-        wp = (wp + 1) % 256;
-        beqWp = wp;
-    }
+    wp = (wp + 1) % 128;
+    mgmtWp = wp;
 
     write16(idx_reg, (UInt16)wp);
     OSSynchronizeIO();

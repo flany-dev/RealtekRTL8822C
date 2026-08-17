@@ -1,12 +1,10 @@
-# v0.0.4 Hardware Acceptance
+# v0.0.5 Hardware Acceptance
 
-The reference RTL8822CE cut D system completed the v0.0.4 functional run,
-including the menu application, non-root controls, Release-profile traffic,
-structured scanning, hidden-network discovery, reconnect, interface lifecycle,
-and sleep/wake testing. This document is the repeatable qualification procedure
-for v0.0.4 and additional hardware. The release qualification is complete on
-the reference macOS 15 system; additional macOS versions and boards remain
-experimental until they complete this procedure independently.
+The reference RTL8822CE cut D system completed the v0.0.5 functional run under
+macOS 14 Sonoma and macOS 15 with both Debug and Release profiles. Validation
+includes the menu application, non-root controls, traffic, structured scanning,
+hidden-network discovery, reconnect, interface lifecycle, and sleep/wake. This
+document is the repeatable qualification procedure for v0.0.5.
 
 Run this procedure on the exact Debug and Release artifacts intended for the
 release. Record artifact hashes, macOS version, OpenCore version, PCI ID, chip
@@ -14,8 +12,8 @@ revision, IOMMU state, access-point model, channel, and bandwidth.
 
 IOMMU state is recorded for compatibility evidence, not as a pass/fail
 requirement. The reference system operates without IOMMU and with DMA
-protection enabled. Other machines should use the firmware and OpenCore policy
-that is stable for their complete hardware configuration.
+protection enabled. Use the firmware and OpenCore policy that is stable for the
+complete hardware configuration.
 
 Use Debug for internal state validation. Repeat the user-facing scenarios with
 Release to confirm normal operation without diagnostic output.
@@ -36,13 +34,18 @@ Debug acceptance:
 - `DriverBuildTargetMacOS` reports `12.0` for Debug and `15.5` for Release;
 - power and interface state are active;
 - firmware, EFUSE, DMA, PHY, DACK, IQK, and TXGAPK complete without failure;
+- `RTL8822CRXPacketPoolStatus` reports `ready` or
+  `ready-individual-fallback`; Debug records the bounded request size, ready
+  count, allocator result, and smallest successful batch;
+- BEQ and MGMTQ have their reviewed descriptor counts while BKQ, VIQ, and VOQ
+  remain disabled because the current data path has no producer for them;
 - TXDMA and TX error status are zero;
 - interrupt masks are `000004fd/00000a00/00010000`.
 
 Complete at least ten cold boots. Every boot must scan and connect without a
 firmware, calibration, DMA, or interface failure.
 
-On every machine record:
+For every qualification run, record:
 
 ```sh
 "$RTL8822CCTL" availability
@@ -65,11 +68,10 @@ start failure must still be reported through `RTL8822CStartResult` and its
 stable failure stage.
 
 The Debug macOS 12 deployment target is an experimental compatibility-testing
-option only. It links the pinned backward-compatible MacKernelSDK kmod startup
-objects, but has been run on the macOS 15 reference machine, not macOS 12-14.
-macOS 14 is the first required secondary-system target. Do not
-record an older macOS version as supported until it completes this entire
-procedure independently.
+option. It links the pinned backward-compatible MacKernelSDK kmod startup
+objects. Both Debug and Release are runtime-confirmed on the reference hardware
+under macOS 14 and macOS 15. macOS 12 and macOS 13 remain experimental until
+the complete procedure is confirmed there.
 
 ## 2. Scan and channel coverage
 
@@ -118,7 +120,7 @@ Test a router and an Android hotspot using `RealtekRTL8822CMenu.app`:
     failure, including a queued connection.
 
 Repeat the connection through `rtl8822cctl connect` as a CLI fallback. Neither
-the application nor v0.0.4 CLI commands should require `sudo`.
+the application nor v0.0.5 CLI commands should require `sudo`.
 
 Reject stale credentials, stale CAM entries, replay failures, permanent queue
 stalls, TXDMA faults, or an inability to reconnect.
@@ -149,6 +151,9 @@ a bidirectional test. During the run:
 
 Debug acceptance for the bounded RX poll:
 
+- the RX packet reserve records no packet-path miss; a transient batch failure
+  is acceptable only when the bounded fallback replenishes the reserve and the
+  final pool remains healthy;
 - the reported `max_batch` does not exceed the configured `budget`, and the
   final budget/delay values match the reviewed release source;
 - sustained downlink must not exceed 254 outstanding BEQ descriptors; the

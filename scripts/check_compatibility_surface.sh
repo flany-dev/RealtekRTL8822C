@@ -25,7 +25,7 @@ grep -q 'if #available(macOS 13.0, \*)' app/RealtekRTL8822CMenu.swift
 grep -q 'guard #available(macOS 13.0, \*)' app/RealtekRTL8822CMenu.swift
 
 # Match the RTL8822CE PCI identity only. Subsystem vendor/device and revision
-# must not become false-negative gates for another board using the same chip.
+# are diagnostic evidence, not hardware eligibility gates.
 match=$(/usr/libexec/PlistBuddy -c \
     'Print :IOKitPersonalities:RealtekRTL8822C:IOPCIMatch' Info.plist)
 case " $match " in
@@ -63,6 +63,30 @@ grep -q 'configurePciPhyCompatibility' src/RealtekRTL8822C.cpp
 grep -q 'RTL8822CPCIPhyConfig' src/RealtekRTL8822C.cpp
 grep -q 'strcmp(key, "RTL8822CPCIPhyConfig")' app/bridge/RTL8822CClient.c
 grep -q 'strcmp(key, "RTL8822CPCIeLinkConfig")' app/bridge/RTL8822CClient.c
+grep -q 'strcmp(key, "RTL8822CRXPacketPoolStatus")' \
+    app/bridge/RTL8822CClient.c
+grep -q 'RTL8822CDebugRXPacketPoolSetup' src/RealtekRTL8822C.cpp
+grep -q 'RTW_DEBUG_PROPERTY("Debug_Diagnostics_Revision", RTW_VERSION)' \
+    src/RealtekRTL8822C.cpp
+if grep -Eq 'diag=0\.0\.[0-9]|0\.0\.3-full-band-passive-scan' \
+    src/RealtekRTL8822C.cpp; then
+    echo "Debug diagnostic revision must follow RTW_VERSION" >&2
+    exit 1
+fi
+if grep -q 'refillRxPacketPool(kRtwRxPacketPoolCapacity)' \
+    src/RealtekRTL8822C.cpp; then
+    echo "initial RX reserve must use bounded refill batches" >&2
+    exit 1
+fi
+# The current datapath owns only BEQ and MGMTQ. Do not reintroduce physically
+# contiguous queues that have no producer and only increase startup pressure.
+if grep -Eq 'start:(bkq|viq|voq)-|[bBvV][kio][qQ](Desc|PayloadDmaCmd)' \
+    src/RealtekRTL8822C.cpp; then
+    echo "unused BKQ/VIQ/VOQ DMA pools must remain removed" >&2
+    exit 1
+fi
+grep -q 'qsel != 18' src/RealtekRTL8822C.cpp
+grep -q '#if RTW_DEBUG' src/RealtekRTL8822C.cpp
 grep -q 'if (includeDebug && controllerService)' app/bridge/RTL8822CClient.c
 grep -q 'RTWMergeMissingProperty, properties' app/bridge/RTL8822CClient.c
 grep -q 'driverAvailability == .ready && debugDriver' \

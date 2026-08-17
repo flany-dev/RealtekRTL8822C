@@ -382,7 +382,8 @@ int32_t RTWClientCopyReport(char* output, size_t outputCapacity,
                         strcmp(key, "RTL8822CPCIELinkSpeed") == 0 ||
                         strcmp(key, "RTL8822CPCIELinkWidth") == 0 ||
                         strcmp(key, "RTL8822CPCIPhyConfig") == 0 ||
-                        strcmp(key, "RTL8822CPCIeLinkConfig") == 0;
+                        strcmp(key, "RTL8822CPCIeLinkConfig") == 0 ||
+                        strcmp(key, "RTL8822CRXPacketPoolStatus") == 0;
         if ((!includeDebug || !isDebug) && !isPublic) continue;
         if (!RTWCopyCFValueString(values[index], value, sizeof(value))) continue;
 

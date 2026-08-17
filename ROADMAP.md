@@ -40,9 +40,9 @@ Version 0.0.3 focuses on scan/connection stability and compatibility:
 - Explicit receive-only/DFS channel presentation instead of unsafe association
   attempts.
 - macOS 12 deployment targets for the menu application and CLI. The Debug kext
-  also has an experimental macOS 12 deployment target for compatibility testing;
-  this has not been validated on macOS 12-14 and is not a support claim. Release
-  remains targeted at the hardware-confirmed macOS 15 environment.
+  also has an experimental macOS 12 deployment target for compatibility
+  testing. Runtime confirmation for macOS 14 was added later in v0.0.5.
+  Release remains built with the macOS 15.5 target.
 - Exact RTL8822CE `10ec:c822` matching without subsystem-vendor, laptop-model,
   or PCI-revision restrictions.
 - Debug and log-free Release hardware validation, including scan, WPA2,
@@ -67,19 +67,34 @@ established channel policy:
 - retain a start-only, bounded Release report and compile deeper diagnostics out
   of Release so the normal packet path has no additional reporting cost;
 - retain macOS 12 deployment targets for Debug kext and userspace, with macOS
-  12-14 support remaining experimental until separate hardware runs pass, and
+  12-14 runtime status still evidence-gated at the time of release, and
   use the pinned backward-compatible MacKernelSDK kmod startup objects;
 
-The reference macOS 15 cut-D system completed the release acceptance matrix.
-macOS 12-14 and additional RTL8822CE boards remain experimental until each
-configuration completes the same matrix independently.
+The reference cut-D system completed the v0.0.4 release acceptance matrix on
+macOS 15. The same reference hardware later completed Debug and Release
+validation on macOS 14 as part of v0.0.5.
+
+## v0.0.5 - released
+
+Version 0.0.5 reduces startup allocation pressure and removes Release-only
+diagnostic overhead:
+
+- build the initial RX mbuf reserve in adaptive batches with a bounded
+  individual-allocation fallback and provider-resident failure evidence;
+- remove unused BKQ, VIQ, and VOQ DMA rings and payload arenas;
+- restrict raw 802.11 submission to the implemented MGMTQ contract;
+- compile CCX requests, C2H diagnostic parsing, raw RX formatting, and
+  management register snapshots out of Release;
+- retain the complete diagnostics in Debug without adding Release packet-path
+  publication;
+- runtime-confirm both Debug and Release on the reference RTL8822CE cut D
+  hardware under macOS 14 Sonoma and macOS 15.
 
 ## Later work
 
 - Implement DFS regulatory-domain selection, CAC, radar detection, evacuation,
   and guarded transmit support as a separate evidence-gated milestone.
-- Expand the RTL8822CE board, AP, macOS, bandwidth, interrupt, and sleep/wake
-  matrix.
+- Expand the AP, macOS, bandwidth, interrupt, and sleep/wake validation matrix.
 - Add WPA3/SAE, Enterprise authentication, and PMF in separate milestones.
 - Continue replacing register literals with named definitions tied to the
   pinned Linux rtw88 reference.

@@ -34,6 +34,16 @@ static void refillReserve(PacketReserve& reserve, std::uint32_t capacity,
     reserve.refillPending = reserve.count < lowWatermark;
 }
 
+static std::uint32_t adaptiveBatch(std::uint32_t requested,
+                                   std::uint32_t allocatorLimit) {
+    std::uint32_t batch = requested;
+    while (batch >= 16U) {
+        if (batch <= allocatorLimit) return batch;
+        batch /= 2U;
+    }
+    return 0U;
+}
+
 static PlaintextView ccmpPlaintextView(const std::uint8_t* frame,
                                        std::uint32_t len,
                                        std::uint32_t headerLen) {
@@ -73,6 +83,22 @@ int main() {
     refillReserve(reserve, 512U, 384U, 128U);
     assert(reserve.count == 480U);
     assert(!reserve.refillPending);
+
+    // Startup uses the normal 128-packet budget rather than one atomic 512
+    // request, and halves the request for older allocators when necessary.
+    assert(adaptiveBatch(128U, 128U) == 128U);
+    assert(adaptiveBatch(128U, 64U) == 64U);
+    assert(adaptiveBatch(128U, 32U) == 32U);
+    assert(adaptiveBatch(128U, 15U) == 0U);
+
+    PacketReserve startup{0U, 512U, false};
+    for (std::uint32_t attempt = 0; attempt < 8U && startup.count < 128U;
+         attempt++) {
+        const std::uint32_t batch = adaptiveBatch(128U, 32U);
+        assert(batch != 0U);
+        startup.count += batch;
+    }
+    assert(startup.count >= 128U);
 
     return 0;
 }

@@ -1,7 +1,7 @@
 # RealtekRTL8822C
 
 RealtekRTL8822C is an x86_64 macOS PCIe driver for the Realtek RTL8822CE
-(`10ec:c822`). Version `0.0.4` is the current release.
+(`10ec:c822`). Version `0.0.5` is the current release.
 
 The driver is implemented as an `IOEthernetController` with a native menu bar
 application, `RealtekRTL8822CMenu`, and the companion command-line utility
@@ -10,12 +10,13 @@ Apple wireless services.
 
 ## Supported configuration
 
-The reference configuration is an RTL8822CE cut D system running macOS 15
-through OpenCore on the legacy PCI interrupt path. AppleVTD/IOMMU is not a
-driver requirement: the reference machine has been validated without IOMMU and
-with DMA protection enabled. IOMMU and DMA-protection policy is platform- and
-bootloader-specific; use the configuration that is stable for the rest of the
-machine.
+The reference configuration is an RTL8822CE cut D system running through
+OpenCore on the legacy PCI interrupt path. Both Debug and Release profiles are
+runtime-confirmed on this same reference hardware under macOS 14 Sonoma and
+macOS 15. AppleVTD/IOMMU is not a driver requirement: the reference machine has
+been validated without IOMMU and with DMA protection enabled. IOMMU and
+DMA-protection policy is platform- and bootloader-specific; use the
+configuration that is stable for the rest of the machine.
 
 Hardware-confirmed functionality includes:
 
@@ -32,12 +33,11 @@ Hardware-confirmed functionality includes:
   credential recovery, and native link notifications;
 - separate diagnostic Debug and log-free Release profiles.
 
-The final v0.0.4 Release profile has been tested on the reference system through
-normal traffic, sustained load, reconnect, and sleep/wake without finding a
-driver failure. This remains a single-system confirmed matrix, not a claim of
-compatibility with every RTL8822CE laptop, macOS version, or firmware
-configuration. A secondary macOS 14 board remains an important compatibility
-target.
+The final v0.0.5 Debug and Release profiles have been tested on the reference
+system under macOS 14 and macOS 15 through scanning, WPA2 traffic, sustained
+load, reconnect, and lifecycle operation without finding a driver failure.
+This remains a reference-system confirmation, not a universal compatibility
+claim for every RTL8822CE configuration or macOS version.
 
 ## Channel policy and limitations
 
@@ -55,8 +55,8 @@ The following are not supported:
 - automatic installation or modification of an OpenCore configuration.
 
 HT40/VHT40 selection is implemented, but the published reference matrix is
-centered on hardware-confirmed 20 MHz and VHT80 links. Additional boards, APs,
-macOS versions, and bandwidth combinations remain useful compatibility data.
+centered on hardware-confirmed 20 MHz and VHT80 links. Unvalidated AP, macOS,
+and bandwidth combinations remain experimental.
 
 ## Build
 
@@ -87,16 +87,17 @@ runtime: it shows **Debug Info** for a loaded Debug kext and **Fail Info…** fo
 a failed Debug start, reading the latter from the PCI provider without a
 controller service. Release retains only a bounded start-time compatibility
 result, so both diagnostic buttons stay hidden for a Release kext. Neither
-profile relies on `IOLog`, and no v0.0.4
+profile relies on `IOLog`, and no v0.0.5
 compatibility property is updated from the packet path. Automated binary checks
 enforce this boundary.
 
 The application and CLI use a macOS 12 deployment target. The Debug kext also
 uses an experimental macOS 12 deployment target for compatibility testing and
 links the pinned MacKernelSDK startup objects instead of newer SDK 15.5 kmod
-objects. Source and load-command compatibility are checked, but runtime on
-macOS 12-14 still requires hardware evidence. The Release kext retains the
-hardware-confirmed macOS 15.5 target.
+objects. Both profiles are runtime-confirmed on macOS 14 and macOS 15 on the
+reference hardware. macOS 12 and macOS 13 remain experimental. The Release
+kext retains its macOS 15.5 build target despite the confirmed macOS 14 runtime
+result.
 
 Deployment is deliberately outside the build system. Copy the selected kext
 and utility manually to the locations used by your boot configuration. Keep a
@@ -117,14 +118,14 @@ under `build/package/`.
 `make package` creates the complete maintainer archive, two kext-only GitHub
 Release assets, and the menu application asset:
 
-- `build/package/RealtekRTL8822C-0.0.4-Release.zip`;
-- `build/package/RealtekRTL8822C-0.0.4-Debug.zip`;
-- `build/package/RealtekRTL8822CMenu-0.0.4.zip`.
+- `build/package/RealtekRTL8822C-0.0.5-Release.zip`;
+- `build/package/RealtekRTL8822C-0.0.5-Debug.zip`;
+- `build/package/RealtekRTL8822CMenu-0.0.5.zip`.
 
 The Release driver archive contains only `RealtekRTL8822C.kext`. The Debug
 archive contains the Debug kext and matching Debug `rtl8822cctl`, so a failed
 startup report can be collected without compiling the project. The application
-archive contains only `RealtekRTL8822CMenu.app` and is a normal v0.0.4 release
+archive contains only `RealtekRTL8822CMenu.app` and is a normal v0.0.5 release
 download alongside the two driver archives.
 `make package-local` creates the complete locally named test archive. None of
 these commands installs anything.
@@ -134,7 +135,7 @@ these commands installs anything.
 Launch `RealtekRTL8822CMenu.app` for menu bar scanning, connection,
 disconnect, and Wi-Fi on/off control. WPA2 credentials are stored in the user
 Keychain. Driver commands use a narrow local-user `IOUserClient` and do not
-require `sudo` with the v0.0.4 kext.
+require `sudo` with the v0.0.5 kext.
 
 If initialization fails, the app and `rtl8822cctl availability` report that
 state separately from an unloaded kext. `rtl8822cctl report` then reads the
@@ -151,7 +152,7 @@ password without echoing it or placing it in shell history. See the
 
 - [Roadmap](ROADMAP.md)
 - [Changelog](CHANGELOG.md)
-- [v0.0.4 release notes](RELEASE_NOTES.md)
+- [v0.0.5 release notes](RELEASE_NOTES.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)

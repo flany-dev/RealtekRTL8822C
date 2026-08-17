@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.0.5 - 2026-08-17
+
+### macOS compatibility
+
+- Build the initial RX mbuf reserve in adaptive batches of at most 128 packets
+  instead of one nonblocking 512-packet allocation. Older allocators can reduce
+  the batch to 64/32/16 packets, with a bounded individual-allocation fallback.
+- Preserve packet-pool setup status and Debug-only allocator details on the PCI
+  provider so failed startup reports identify work-loop, timer, errno, batch,
+  and ready-count failures separately.
+- Remove the unused BKQ, VIQ, and VOQ descriptor/payload allocations. The
+  active implementation transmits data through BEQ and management frames
+  through MGMTQ, so the retired queues consumed about 0.75 MiB of contiguous
+  DMA memory and added eighteen unnecessary allocation/command/mapping failure
+  points.
+- Runtime-confirmed both Debug and Release profiles on the reference RTL8822CE
+  cut D hardware under macOS 14 Sonoma and macOS 15.
+
+### Performance and robustness
+
+- Keep CCX packet reports, raw RX descriptor formatting, management register
+  snapshots, and sampled TX reports behind the Debug compile-time boundary.
+  Release no longer asks firmware for diagnostic TX reports or parses their
+  C2H responses on the receive path.
+- Restrict the raw 802.11 transmit helper to its actual MGMTQ contract and
+  reject invalid queue selectors or oversized frames. This prevents a future
+  caller from bypassing BEQ locking, completion accounting, and backpressure.
+- Correct the Debug RX packet-pool report so `fallback` reflects the allocator
+  fallback mode instead of duplicating the pool-miss counter.
+
 ## 0.0.4 - 2026-08-17
 
 ### Hardware compatibility
@@ -41,8 +71,7 @@
 ### Release scope
 
 - Retained experimental macOS 12 targets for Debug kext and userspace while
-  keeping Release at macOS 15.5. macOS 14 secondary-hardware evidence remains
-  required before backward-compatibility claims are promoted.
+  keeping Release at macOS 15.5.
 - Deferred DFS transmit support to a later independent milestone.
 
 ## 0.0.3 - 2026-07-31

@@ -47,4 +47,11 @@ if xargs grep -En 'handoff-v[0-9]+|Research Handoff|Next runtime test:' < "$publ
     exit 1
 fi
 
+if xargs grep -Ein \
+    'secondary (macOS )?(14 )?(board|system)|external tester|another board|other board|new board|17aa:c123' \
+    < "$public_list"; then
+    echo "documentation privacy check failed: external-person or separate-board context leaked" >&2
+    exit 1
+fi
+
 echo "Documentation privacy check passed"

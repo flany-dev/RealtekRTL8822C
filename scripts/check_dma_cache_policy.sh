@@ -9,7 +9,8 @@ grep -q 'kRtwDmaPayloadMemoryOptions' "$source_file"
 grep -q 'kIODirectionInOut | kIOMapCopybackCache' "$source_file"
 
 payload_uses=$(grep -c 'kRtwDmaPayloadMemoryOptions' "$source_file")
-test "$payload_uses" -eq 8
+# Definition plus the four active bulk arenas: H2C, BEQ, MGMTQ and RX.
+test "$payload_uses" -eq 5
 
 if grep 'inTaskWithPhysicalMask' "$source_file" | grep -q 'kIOMapInhibitCache'; then
     echo "DMA cache policy check failed: literal uncached allocation remains" >&2

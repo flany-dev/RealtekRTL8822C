@@ -19,7 +19,7 @@ rtl8822cctl on
 rtl8822cctl off
 ```
 
-With the v0.0.4 kext, commands use the versioned RTL8822C local-user
+With the v0.0.5 kext, commands use the versioned RTL8822C local-user
 client and do not require root privileges. The user client accepts only status,
 structured scan snapshots, scan, connect, cancellation, disconnect, and
 interface-state commands; it exposes no DMA memory or register access. The
@@ -63,9 +63,10 @@ machine-readable connection-attempt ID, phase, result, and failure reason.
 silicon cut, RF-path count, RFE option, and failure reason. Debug additionally
 includes a stage trace and selected PCI, chip, EFUSE, and RFE evidence. The
 Debug kext reports the experimental macOS 12 target used for compatibility
-testing and links the pinned MacKernelSDK startup objects. This has not been
-validated on macOS 12-14 and does not establish support for those systems.
-Release retains the hardware-confirmed macOS 15.5 target.
+testing and links the pinned MacKernelSDK startup objects. Debug and Release
+are runtime-confirmed on the reference hardware under macOS 14 and macOS 15.
+macOS 12 and macOS 13 remain experimental. Release retains its macOS 15.5
+build target.
 
 Before sharing `rtl8822cctl report`, redact SSIDs, BSSIDs, local IP addresses, and
 other device identifiers. The report must never expose raw PMK/PTK/GTK bytes;
@@ -76,6 +77,6 @@ absence of those deep fields is expected, not a reporting failure. Its bounded
 startup properties are written only during initialization and do not affect the
 packet path.
 
-The v0.0.4 Debug driver archive includes the matching Debug `rtl8822cctl` so an
-external tester can run `rtl8822cctl availability` and `rtl8822cctl report`
-without building the utility locally.
+The v0.0.5 Debug driver archive includes the matching Debug `rtl8822cctl`, so
+`rtl8822cctl availability` and `rtl8822cctl report` can be run without building
+the utility locally.

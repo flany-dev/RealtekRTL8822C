@@ -1,6 +1,6 @@
 # RealtekRTL8822CMenu
 
-`RealtekRTL8822CMenu.app` is the v0.0.4 native macOS menu bar frontend for the
+`RealtekRTL8822CMenu.app` is the v0.0.5 native macOS menu bar frontend for the
 RealtekRTL8822C driver. It provides a familiar Wi-Fi control surface without
 claiming integration with Apple's private Wi-Fi framework.
 
@@ -68,7 +68,7 @@ than the currently connected AP.
 
 ## Driver requirement
 
-The app requires the matching v0.0.4 kext. It communicates through a
+The app requires the matching v0.0.5 kext. It communicates through a
 fixed-size, versioned `IOUserClient` available only to the active local user.
 No privileged helper, `sudo`, shell command, arbitrary registry-property write,
 DMA mapping, or register-control method is exposed.
@@ -109,12 +109,12 @@ Compatibility Report** with bounded public fields.
 build/app/RealtekRTL8822CMenu.app
 ```
 
-The v0.0.4 GitHub Release asset `RealtekRTL8822CMenu-0.0.4.zip` contains only
+The v0.0.5 GitHub Release asset `RealtekRTL8822CMenu-0.0.5.zip` contains only
 the Release application bundle. Install the matching Release or Debug kext
 separately; the standalone application archive does not contain a driver.
 
 There is no install target. Copy the selected app manually to `/Applications`
-or another user-selected location after installing the matching kext through
-the user's existing bootloader workflow. Public development builds are ad-hoc
-signed rather than Apple-notarized; on first launch, use Finder's **Open**
-confirmation if Gatekeeper asks for approval.
+after installing the matching kext through the existing bootloader workflow.
+Public development builds are ad-hoc signed rather than Apple-notarized; on
+first launch, use Finder's **Open** confirmation if Gatekeeper asks for
+approval.

@@ -237,7 +237,7 @@ private enum WiFiStatusGlyph {
                 segment <= clamped ? 1.0 : 0.20
             }
 
-            let center = NSPoint(x: 9.5, y: 3.7)
+            let center = NSPoint(x: 9.5, y: 5.35)
             for (segment, radius) in [CGFloat(3.6), 6.3, 9.0].enumerated() {
                 NSColor.black.withAlphaComponent(alpha(segment + 2)).setStroke()
                 let path = NSBezierPath()
@@ -249,7 +249,7 @@ private enum WiFiStatusGlyph {
             }
 
             NSColor.black.withAlphaComponent(alpha(1)).setFill()
-            NSBezierPath(ovalIn: NSRect(x: 7.9, y: 2.1,
+            NSBezierPath(ovalIn: NSRect(x: 7.9, y: 3.75,
                                        width: 3.2, height: 3.2)).fill()
             return true
         }
@@ -444,7 +444,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         refreshStatus()
         statusTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) {
             [weak self] _ in
-            Task { @MainActor in self?.refreshStatus() }
+            Task { @MainActor [weak self] in self?.refreshStatus() }
         }
     }
 
